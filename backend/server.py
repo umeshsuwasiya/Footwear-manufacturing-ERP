@@ -91,6 +91,7 @@ class BomItem(BaseModel):
     unit: str
     rate: float
     quantity: float
+    yield_per_unit: float = 1  # pairs produced per 1 unit of material (e.g., 10 uppers per meter)
     waste_pct: float = 0
     section: Literal["upper", "sole", "lining", "accessory", "consumable", "packing", "other"] = "other"
 
@@ -291,11 +292,15 @@ async def delete_material(mid: str, request: Request):
 
 # ---------- STYLES ----------
 def compute_style_costing(style: dict) -> dict:
-    materials_cost = sum(
-        (b["rate"] * b["quantity"] * (1 + (b.get("waste_pct", 0) / 100)))
-        for b in style.get("bom", [])
-    )
-    labor_cost = sum(l["rate"] for l in style.get("labor", []))
+    materials_cost = 0.0
+    for b in style.get("bom", []):
+        rate = float(b.get("rate", 0))
+        qty = float(b.get("quantity", 0))
+        yld = float(b.get("yield_per_unit", 1) or 1)
+        waste = float(b.get("waste_pct", 0) or 0)
+        # cost per pair = (rate * qty / yield) * (1 + waste%)
+        materials_cost += (rate * qty / yld) * (1 + waste / 100)
+    labor_cost = sum(float(l.get("rate", 0)) for l in style.get("labor", []))
     base_cost = materials_cost + labor_cost
     overhead_cost = base_cost * (style.get("overhead_pct", 0) / 100)
     packing = style.get("packing_cost", 0)

@@ -50,21 +50,24 @@ export default function Costing() {
                       <th className="px-3 py-2">Material</th>
                       <th className="px-3 py-2">Section</th>
                       <th className="px-3 py-2 text-right">Rate</th>
-                      <th className="px-3 py-2 text-right">Qty</th>
+                      <th className="px-3 py-2 text-right">Qty/pair</th>
+                      <th className="px-3 py-2 text-right">Yield</th>
                       <th className="px-3 py-2 text-right">Waste</th>
-                      <th className="px-3 py-2 text-right">Cost</th>
+                      <th className="px-3 py-2 text-right">Cost/pair</th>
                     </tr>
                   </thead>
                   <tbody>
                     {selected.bom.map((b, i) => {
-                      const cost = Number(b.rate) * Number(b.quantity) * (1 + Number(b.waste_pct || 0) / 100);
+                      const yld = Number(b.yield_per_unit || 1) || 1;
+                      const cost = (Number(b.rate) * Number(b.quantity) / yld) * (1 + Number(b.waste_pct || 0) / 100);
                       return (
                         <tr key={i} className="border-t border-slate-200">
                           <td className="px-3 py-1.5 font-mono">{b.material_code}</td>
                           <td className="px-3 py-1.5">{b.material_name}</td>
                           <td className="px-3 py-1.5"><span className="text-[10px] uppercase tracking-wider">{b.section}</span></td>
-                          <td className="px-3 py-1.5 text-right font-mono">₹{b.rate}</td>
-                          <td className="px-3 py-1.5 text-right font-mono">{b.quantity} {b.unit}</td>
+                          <td className="px-3 py-1.5 text-right font-mono">₹{b.rate}/{b.unit}</td>
+                          <td className="px-3 py-1.5 text-right font-mono">{b.quantity}</td>
+                          <td className="px-3 py-1.5 text-right font-mono">{yld}</td>
                           <td className="px-3 py-1.5 text-right font-mono">{b.waste_pct}%</td>
                           <td className="px-3 py-1.5 text-right font-mono font-bold">{inr(cost)}</td>
                         </tr>

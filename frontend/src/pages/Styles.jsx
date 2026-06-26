@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { http, inr, num } from "../lib/api";
 import { PageHeader, Card, BtnPrimary, BtnSecondary, Input, Select, Badge } from "../components/ui-kit";
 import { Drawer } from "./Materials";
-import { Plus, Trash2, Pencil, Save, Calculator as CalcIcon } from "lucide-react";
+import { Plus, Trash2, Pencil, Save, Calculator as CalcIcon, Upload } from "lucide-react";
 
 const SECTIONS = ["upper", "sole", "lining", "accessory", "consumable", "packing", "other"];
 
@@ -45,7 +45,13 @@ export default function Styles() {
       ...form,
       overhead_pct: Number(form.overhead_pct), packing_cost: Number(form.packing_cost),
       margin_pct: Number(form.margin_pct), gst_pct: Number(form.gst_pct),
-      bom: form.bom.map(b => ({ ...b, quantity: Number(b.quantity), waste_pct: Number(b.waste_pct || 0), rate: Number(b.rate) })),
+      bom: form.bom.map(b => ({
+        ...b,
+        quantity: Number(b.quantity),
+        yield_per_unit: Number(b.yield_per_unit || 1),
+        waste_pct: Number(b.waste_pct || 0),
+        rate: Number(b.rate),
+      })),
       labor: form.labor.map(l => ({ ...l, rate: Number(l.rate) })),
     };
     if (editId) await http.patch(`/styles/${editId}`, body); else await http.post("/styles", body);
@@ -56,10 +62,28 @@ export default function Styles() {
     await http.delete(`/styles/${id}`); load();
   };
 
+  const onImageFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 1024 * 1024) {
+      alert(`Image too large (${(file.size / 1024).toFixed(0)}KB). Please upload an image under 1MB.`);
+      e.target.value = "";
+      return;
+    }
+    if (!/^image\/(png|jpe?g|webp|gif)$/i.test(file.type)) {
+      alert("Only PNG, JPG, WEBP, or GIF allowed.");
+      e.target.value = "";
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => setForm((f) => ({ ...f, image_url: reader.result }));
+    reader.readAsDataURL(file);
+  };
+
   const addBomRow = (material) => {
     setForm((f) => ({ ...f, bom: [...f.bom, {
       material_id: material.id, material_code: material.code, material_name: material.name,
-      unit: material.unit, rate: material.rate, quantity: 1, waste_pct: 5, section: material.category,
+      unit: material.unit, rate: material.rate, quantity: 1, yield_per_unit: 1, waste_pct: 5, section: material.category,
     }]}));
   };
 
@@ -69,9 +93,12 @@ export default function Styles() {
   const addLabor = () => setForm((f) => ({ ...f, labor: [...f.labor, { name: "Labor", rate: 0 }] }));
   const removeLabor = (i) => setForm((f) => ({ ...f, labor: f.labor.filter((_, idx) => idx !== i) }));
 
-  // live costing
+  // live costing — uses (rate * qty / yield) * (1 + waste%)
   const costing = useMemo(() => {
-    const matCost = form.bom.reduce((s, b) => s + Number(b.rate) * Number(b.quantity) * (1 + Number(b.waste_pct || 0) / 100), 0);
+    const matCost = form.bom.reduce((s, b) => {
+      const yld = Number(b.yield_per_unit || 1) || 1;
+      return s + (Number(b.rate) * Number(b.quantity) / yld) * (1 + Number(b.waste_pct || 0) / 100);
+    }, 0);
     const labCost = form.labor.reduce((s, l) => s + Number(l.rate), 0);
     const base = matCost + labCost;
     const oh = base * Number(form.overhead_pct) / 100;
@@ -130,12 +157,35 @@ export default function Styles() {
                 <Input label="Style Code" value={form.code} onChange={(e) => setForm({ ...form, code: e.target.value })} testId="form-style-code" />
                 <Input label="Name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} testId="form-style-name" />
               </div>
-              <div className="grid grid-cols-3 gap-3">
+              <div className="grid grid-cols-2 gap-3">
                 <Input label="Category" value={form.category} onChange={(e) => setForm({ ...form, category: e.target.value })} />
                 <Input label="Base Size" value={form.base_size} onChange={(e) => setForm({ ...form, base_size: e.target.value })} />
-                <Input label="Image URL" value={form.image_url} onChange={(e) => setForm({ ...form, image_url: e.target.value })} />
               </div>
               <Input label="Description" value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
+
+              {/* Image upload */}
+              <div>
+                <div className="text-[10px] uppercase tracking-wider font-bold text-slate-600 mb-1">Style Image (max 1MB)</div>
+                <div className="flex gap-3 items-start">
+                  <div className="w-28 h-28 border-2 border-dashed border-slate-300 bg-slate-50 grid place-items-center overflow-hidden flex-shrink-0">
+                    {form.image_url ? (
+                      <img src={form.image_url} alt="preview" className="w-full h-full object-cover" data-testid="image-preview" />
+                    ) : (
+                      <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold text-center px-2">No image</div>
+                    )}
+                  </div>
+                  <div className="flex-1 space-y-2">
+                    <label className="inline-block bg-white text-slate-900 font-bold uppercase tracking-wider text-xs px-4 py-2 border-2 border-slate-300 hover:border-[#0F172A] transition-colors cursor-pointer" data-testid="image-upload-label">
+                      <Upload className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Upload Image
+                      <input type="file" accept="image/png,image/jpeg,image/webp,image/gif" className="hidden" onChange={onImageFile} data-testid="image-upload-input" />
+                    </label>
+                    {form.image_url && (
+                      <button type="button" onClick={() => setForm({ ...form, image_url: "" })} className="ml-2 text-xs uppercase tracking-wider text-slate-500 hover:text-red-600 font-bold" data-testid="image-clear">Remove</button>
+                    )}
+                    <div className="text-[10px] text-slate-500">PNG, JPG, WEBP — max 1MB. Stored inline (base64).</div>
+                  </div>
+                </div>
+              </div>
 
               {/* BOM */}
               <div>
@@ -157,17 +207,21 @@ export default function Styles() {
                       <th className="px-2 py-2 font-bold">Material</th>
                       <th className="px-2 py-2 font-bold">Section</th>
                       <th className="px-2 py-2 font-bold text-right">Rate</th>
-                      <th className="px-2 py-2 font-bold text-right">Qty</th>
+                      <th className="px-2 py-2 font-bold text-right" title="Material consumption per pair">Qty</th>
+                      <th className="px-2 py-2 font-bold text-right" title="Pairs produced per 1 unit of material (e.g., 10 uppers per metre)">Yield</th>
                       <th className="px-2 py-2 font-bold text-right">Waste%</th>
-                      <th className="px-2 py-2 font-bold text-right">Cost</th>
+                      <th className="px-2 py-2 font-bold text-right">Cost/pair</th>
                       <th />
                     </tr>
                   </thead>
                   <tbody>
                     {form.bom.length === 0 && (
-                      <tr><td colSpan="7" className="px-2 py-6 text-center text-slate-400">No items. Add from dropdown above.</td></tr>
+                      <tr><td colSpan="8" className="px-2 py-6 text-center text-slate-400">No items. Add from dropdown above.</td></tr>
                     )}
-                    {form.bom.map((b, i) => (
+                    {form.bom.map((b, i) => {
+                      const yld = Number(b.yield_per_unit || 1) || 1;
+                      const cost = (Number(b.rate) * Number(b.quantity) / yld) * (1 + Number(b.waste_pct || 0) / 100);
+                      return (
                       <tr key={i} className="border-t border-slate-200">
                         <td className="px-2 py-1.5"><div className="font-mono">{b.material_code}</div><div className="text-[10px] text-slate-500">{b.material_name}</div></td>
                         <td className="px-2 py-1.5">
@@ -175,13 +229,15 @@ export default function Styles() {
                             {SECTIONS.map(s => <option key={s} value={s}>{s}</option>)}
                           </select>
                         </td>
-                        <td className="px-2 py-1.5 text-right font-mono">₹{b.rate}</td>
+                        <td className="px-2 py-1.5 text-right font-mono">₹{b.rate}<span className="text-[10px] text-slate-400">/{b.unit}</span></td>
                         <td className="px-2 py-1.5"><input type="number" step="0.01" value={b.quantity} onChange={(e) => updateBom(i, "quantity", e.target.value)} className="w-16 text-right font-mono border border-slate-300 px-1 py-0.5" /></td>
+                        <td className="px-2 py-1.5"><input type="number" step="0.5" value={b.yield_per_unit ?? 1} onChange={(e) => updateBom(i, "yield_per_unit", e.target.value)} className="w-14 text-right font-mono border border-slate-300 px-1 py-0.5" title="Pairs per 1 unit of material" data-testid={`bom-yield-${i}`} /></td>
                         <td className="px-2 py-1.5"><input type="number" step="0.5" value={b.waste_pct} onChange={(e) => updateBom(i, "waste_pct", e.target.value)} className="w-14 text-right font-mono border border-slate-300 px-1 py-0.5" /></td>
-                        <td className="px-2 py-1.5 text-right font-mono font-bold">{inr(Number(b.rate) * Number(b.quantity) * (1 + Number(b.waste_pct || 0) / 100))}</td>
+                        <td className="px-2 py-1.5 text-right font-mono font-bold">{inr(cost)}</td>
                         <td className="px-2 py-1.5"><button onClick={() => removeBom(i)} className="text-slate-500 hover:text-red-600"><Trash2 className="w-3.5 h-3.5" /></button></td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
