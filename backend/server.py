@@ -5,8 +5,8 @@ load_dotenv(Path(__file__).parent / ".env")
 
 import os
 import logging
-from datetime import datetime, timezone
-from typing import List, Optional, Literal
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional, Literal, Dict
 
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, UploadFile, File, Query
 from starlette.middleware.cors import CORSMiddleware
@@ -251,8 +251,55 @@ class DefectIn(BaseModel):
     status: Literal["open", "in_progress", "closed"] = "open"
 
 
+class StageDurationsIn(BaseModel):
+    """Default ETA hours per production stage. Used to compute deadlines & overdue alerts."""
+    hours: Dict[str, float]
+
+
+# Sensible factory defaults (in hours)
+DEFAULT_STAGE_HOURS = {
+    "procurement": 24, "cutting": 24, "folding": 8, "attachment": 8,
+    "stitching": 48, "lasting": 24, "sole_pasting": 12, "finishing": 12,
+    "dispatched": 0,
+}
+
+
 # ---------- Dependencies ----------
 get_current_user = None  # set after startup
+
+
+async def _get_stage_durations() -> Dict[str, float]:
+    doc = await db.settings.find_one({"_id": "stage_durations"})
+    out = dict(DEFAULT_STAGE_HOURS)
+    if doc and isinstance(doc.get("hours"), dict):
+        out.update({k: float(v) for k, v in doc["hours"].items() if isinstance(v, (int, float))})
+    return out
+
+
+def _compute_deadline(entered_iso: str, hours: float) -> str:
+    try:
+        s = entered_iso.replace("Z", "+00:00") if entered_iso.endswith("Z") else entered_iso
+        t = datetime.fromisoformat(s)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+    except Exception:
+        t = datetime.now(timezone.utc)
+    return (t + timedelta(hours=float(hours or 0))).isoformat()
+
+
+def _overdue_hours(deadline_iso: str | None) -> float:
+    if not deadline_iso:
+        return 0.0
+    try:
+        s = deadline_iso.replace("Z", "+00:00") if deadline_iso.endswith("Z") else deadline_iso
+        dl = datetime.fromisoformat(s)
+        if dl.tzinfo is None:
+            dl = dl.replace(tzinfo=timezone.utc)
+        diff = (datetime.now(timezone.utc) - dl).total_seconds() / 3600
+        return round(diff, 1)
+    except Exception:
+        return 0.0
+
 
 
 # ---------- AUTH ----------
@@ -485,6 +532,9 @@ async def create_po(payload: POIn, request: Request):
     doc["id"] = str(res.inserted_id)
     # auto-create production jobs (one per line item)
     jobs = []
+    durations = await _get_stage_durations()
+    entered = now_iso()
+    deadline = _compute_deadline(entered, durations.get("procurement", 24))
     for li in doc["line_items"]:
         jobs.append({
             "po_id": doc["id"],
@@ -499,6 +549,8 @@ async def create_po(payload: POIn, request: Request):
             "stage": "procurement",
             "rejected_qty": 0,
             "delivery_date": doc.get("delivery_date", ""),
+            "stage_entered_at": entered,
+            "stage_deadline": deadline,
             "created_at": now_iso(),
             "updated_at": now_iso(),
             "history": [{"stage": "procurement", "at": now_iso(), "by": u["email"], "notes": "Job created"}],
@@ -848,6 +900,89 @@ async def report_defect_rate(request: Request):
     }
 
 
+# ---------- SETTINGS (stage durations / ETAs) ----------
+@api.get("/settings/stage-durations")
+async def get_stage_durations(request: Request):
+    await get_current_user(request)
+    return {"hours": await _get_stage_durations(), "defaults": DEFAULT_STAGE_HOURS}
+
+
+@api.put("/settings/stage-durations")
+async def put_stage_durations(payload: StageDurationsIn, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    cleaned = {k: float(v) for k, v in payload.hours.items() if isinstance(v, (int, float)) and float(v) >= 0}
+    await db.settings.update_one(
+        {"_id": "stage_durations"},
+        {"$set": {"hours": cleaned, "updated_at": now_iso(), "updated_by": u["email"]}},
+        upsert=True,
+    )
+    return {"ok": True, "hours": await _get_stage_durations()}
+
+
+# ---------- OVERDUE / DEADLINE ALERTS ----------
+@api.get("/dashboard/overdue")
+async def overdue_jobs(request: Request):
+    """Returns active jobs whose stage_deadline has passed (excluding dispatched)."""
+    await get_current_user(request)
+    jobs = await db.production_jobs.find({"stage": {"$ne": "dispatched"}}).to_list(5000)
+    out = []
+    durations = await _get_stage_durations()
+    for j in jobs:
+        # Backfill deadline if missing (for jobs created before this feature)
+        dl = j.get("stage_deadline")
+        if not dl:
+            entered = j.get("stage_entered_at") or j.get("updated_at") or j.get("created_at")
+            if entered:
+                dl = _compute_deadline(entered, durations.get(j.get("stage", "procurement"), 24))
+        hrs_over = _overdue_hours(dl)
+        if hrs_over > 0:
+            s = stringify(j)
+            s["stage_deadline"] = dl
+            s["overdue_hours"] = hrs_over
+            out.append(s)
+    out.sort(key=lambda r: -r["overdue_hours"])
+    return out
+
+
+# ---------- VISUAL REPORTS ----------
+@api.get("/reports/monthly-production")
+async def report_monthly_production(request: Request):
+    """Pairs produced (dispatched) and started (procurement created) per month for last 12 months."""
+    await get_current_user(request)
+    jobs = await db.production_jobs.find({}).to_list(10000)
+    from collections import defaultdict
+    monthly = defaultdict(lambda: {"started": 0, "dispatched": 0})
+    for j in jobs:
+        created = (j.get("created_at") or "")[:7]
+        if created:
+            monthly[created]["started"] += j.get("quantity", 0) or 0
+        if j.get("stage") == "dispatched":
+            disp_at = (j.get("updated_at") or "")[:7]
+            if disp_at:
+                monthly[disp_at]["dispatched"] += j.get("quantity", 0) or 0
+    rows = [{"month": m, **v} for m, v in sorted(monthly.items())]
+    # Limit to last 12 months
+    return rows[-12:]
+
+
+@api.get("/reports/karigar-output")
+async def report_karigar_output(request: Request,
+                                from_date: Optional[str] = None, to_date: Optional[str] = None):
+    """Per-karigar pairs and earnings for the given period (defaults to current month)."""
+    if not from_date:
+        from_date = datetime.now(timezone.utc).strftime("%Y-%m-01")
+    if not to_date:
+        to_date = datetime.now(timezone.utc).date().isoformat()
+    # delegate to /reports/payroll for the same computation
+    payroll = await report_payroll(request, from_date=from_date, to_date=to_date)
+    rows = [{
+        "worker_id": r["worker_id"], "name": r["name"], "skill": r["skill"],
+        "pairs": r["total_pairs"], "earnings": r["total_earning"], "bonus": r.get("total_bonus", 0),
+    } for r in payroll["rows"]]
+    rows.sort(key=lambda r: -r["pairs"])
+    return rows
+
+
 # ---------- PRODUCTION ----------
 @api.get("/production/jobs")
 async def list_jobs(request: Request):
@@ -862,6 +997,13 @@ async def update_job(jid: str, payload: ProductionStageUpdate, request: Request)
     if not job:
         raise HTTPException(404, "Not found")
     update = {"stage": payload.stage, "updated_at": now_iso()}
+    # If stage actually changed, reset the per-stage clock and deadline
+    if job.get("stage") != payload.stage:
+        durations = await _get_stage_durations()
+        entered = now_iso()
+        hours = float(durations.get(payload.stage, 24))
+        update["stage_entered_at"] = entered
+        update["stage_deadline"] = _compute_deadline(entered, hours) if payload.stage != "dispatched" else None
     if payload.completed_qty is not None:
         update["completed_qty"] = payload.completed_qty
     if payload.rejected_qty is not None:

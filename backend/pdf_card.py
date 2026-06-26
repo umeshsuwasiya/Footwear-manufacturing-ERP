@@ -153,6 +153,46 @@ def build_production_card(job_group: dict, style: dict | None) -> bytes:
         ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
     ]))
 
+    # Per-process tally table: workers fill in actual processed quantity per size
+    proc_rows = [
+        ("CUTTING", "Cutter"),
+        ("UPPER", "Upper Maker"),
+        ("BOTTOM", "Bottom Maker"),
+        ("STITCHING", "Stitcher"),
+        ("LASTING", "Laster"),
+        ("SOLE PASTING", "Sole Paster"),
+        ("FINISH / QC / PACK", "Finisher"),
+    ]
+    tally_header = ["PROCESS"] + [str(s["size"]) for s in sizes] + ["DONE", "REJ", "SIGN"]
+    tally_data = [tally_header]
+    # First row = planned (filled in) for reference
+    tally_data.append(["PLANNED"] + [str(s["quantity"]) for s in sizes] + [str(job_group.get("total_qty", 0)), "—", "—"])
+    for label, _ in proc_rows:
+        tally_data.append([label] + ["" for _ in sizes] + ["", "", ""])
+    tally_t = Table(
+        tally_data,
+        colWidths=[34 * mm] + [(150 - 34) / max(len(sizes), 1) * mm if False else 14 * mm] * len(sizes) + [14 * mm, 12 * mm, 30 * mm],
+    )
+    n_size_cols = len(sizes)
+    tally_t.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 1, BLACK),
+        ("GRID", (0, 0), (-1, -1), 0.4, LINE),
+        ("BACKGROUND", (0, 0), (-1, 0), HEAD),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONT", (0, 0), (-1, 0), "Helvetica-Bold", 8),
+        ("FONT", (0, 1), (0, -1), "Helvetica-Bold", 8),
+        ("FONT", (1, 1), (-1, -1), "Helvetica", 9),
+        ("BACKGROUND", (0, 1), (-1, 1), LIGHT),  # PLANNED row
+        ("TEXTCOLOR", (0, 1), (-1, 1), ACCENT),
+        ("FONT", (0, 1), (-1, 1), "Helvetica-Bold", 9),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),  # tall rows so workers can write
+        ("LINEBELOW", (0, 1), (-1, 1), 1, BLACK),
+    ]))
+
+
     # Components (Upper / Bottom / Sole) with sub-layers
     comp = job_group.get("components", {}) or {}
     def comp_cell(title, done, layers):
@@ -237,6 +277,10 @@ def build_production_card(job_group: dict, style: dict | None) -> bytes:
         Paragraph("SIZE BREAKDOWN", S["h2"]),
         Spacer(1, 2),
         size_t,
+        Spacer(1, 8),
+        Paragraph("PROCESS TALLY · Fill in qty processed per size at each stage", S["h2"]),
+        Spacer(1, 2),
+        tally_t,
         Spacer(1, 8),
         Paragraph("COMPONENTS", S["h2"]),
         Spacer(1, 2),

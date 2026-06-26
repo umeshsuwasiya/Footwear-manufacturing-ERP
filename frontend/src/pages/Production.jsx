@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { http } from "../lib/api";
 import { PageHeader, Card, BtnPrimary, BtnSecondary } from "../components/ui-kit";
 import { useAuth } from "../lib/auth";
-import { FileDown, Check, UserPlus, Edit3, ClipboardList, X, HardHat, GripVertical, Printer } from "lucide-react";
+import { FileDown, Check, UserPlus, Edit3, ClipboardList, X, HardHat, GripVertical, Printer, MessageCircle, AlertTriangle, Clock } from "lucide-react";
 
 const STAGES = [
   { key: "procurement", label: "Procurement", color: "#64748B" },
@@ -70,6 +70,7 @@ function groupJobsByColor(jobs) {
     totalQty: g.rows.reduce((s, r) => s + (r.quantity || 0), 0),
     components: aggregateComponents(g.rows),
     assignments: aggregateAssignments(g.rows),
+    overdueHours: aggregateOverdue(g.rows),
   }));
 }
 
@@ -82,6 +83,20 @@ function aggregateComponents(rows) {
 function aggregateAssignments(rows) {
   const r0 = rows[0] || {};
   return r0.assignments || {};
+}
+
+// Compute the worst overdue hours across all rows in a group; 0 means not overdue.
+function aggregateOverdue(rows) {
+  let worst = 0;
+  const nowMs = Date.now();
+  for (const r of rows) {
+    if (r.stage === "dispatched" || !r.stage_deadline) continue;
+    const dl = new Date(r.stage_deadline).getTime();
+    if (Number.isNaN(dl)) continue;
+    const hrs = (nowMs - dl) / 3600000;
+    if (hrs > worst) worst = hrs;
+  }
+  return Math.round(worst * 10) / 10;
 }
 
 export default function Production() {
@@ -97,6 +112,7 @@ export default function Production() {
   const [draggingWorker, setDraggingWorker] = useState(null);
   const [dropZone, setDropZone] = useState(null);
   const [bulkConfirm, setBulkConfirm] = useState(null);
+  const [waFor, setWaFor] = useState(null);
   const { user } = useAuth();
   const canEdit = ["admin", "manager", "production"].includes(user?.role);
 
@@ -122,6 +138,50 @@ export default function Production() {
         { job_ids: group.rows.map(r => r.id) }, { responseType: "blob" });
       window.open(URL.createObjectURL(new Blob([res.data], { type: "application/pdf" })), "_blank");
     } catch (e) { alert("Print failed: " + (e.response?.data?.detail || e.message)); }
+  };
+
+  // WhatsApp share: download production card PDF AND open WhatsApp Web with a
+  // pre-filled message to the chosen karigar. The user drag-drops the downloaded
+  // PDF into the chat (browsers cannot programmatically attach files to wa.me).
+  const shareViaWhatsApp = async (group, phone) => {
+    try {
+      const res = await http.post("/production/card.pdf",
+        { job_ids: group.rows.map(r => r.id) }, { responseType: "blob" });
+      const blob = new Blob([res.data], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      // trigger download with a descriptive filename
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `ProductionCard_${group.po_number}_${group.style_code}_${(group.color || "color").replace(/\s+/g, "")}.pdf`;
+      document.body.appendChild(a); a.click(); a.remove();
+      // build message
+      const sizeBreak = group.sizes.map(sz => {
+        const row = group.rows.find(r => String(r.size || "—") === sz);
+        return `${sz}:${row?.quantity || 0}`;
+      }).join("  ");
+      const lines = [
+        `SSK FOOTCARE - Production Card`,
+        `PO: ${group.po_number}`,
+        `Style: ${group.style_code}  Color: ${group.color}`,
+        `Total: ${group.totalQty} pairs`,
+        `Sizes: ${sizeBreak}`,
+        group.delivery_date ? `Delivery: ${group.delivery_date}` : "",
+        ``,
+        `Please process as per the attached production card PDF (auto-downloaded).`,
+      ].filter(Boolean);
+      const text = encodeURIComponent(lines.join("\n"));
+      // normalise phone (keep digits & leading +). wa.me prefers no '+' or leading 0.
+      let cleaned = (phone || "").replace(/[^\d+]/g, "");
+      if (cleaned.startsWith("+")) cleaned = cleaned.slice(1);
+      if (cleaned.startsWith("0")) cleaned = cleaned.slice(1);
+      // If only 10 digits, assume India +91
+      if (/^\d{10}$/.test(cleaned)) cleaned = "91" + cleaned;
+      const waUrl = cleaned
+        ? `https://wa.me/${cleaned}?text=${text}`
+        : `https://wa.me/?text=${text}`;
+      window.open(waUrl, "_blank");
+      setWaFor(null);
+    } catch (e) { alert("WhatsApp share failed: " + (e.response?.data?.detail || e.message)); }
   };
 
   const moveGroup = async (group, nextStage) => {
@@ -310,6 +370,7 @@ export default function Production() {
                         onOpenAssign={(role) => setAssignFor({ group: g, role })}
                         onOpenQty={(rowId) => setQtyFor({ group: g, rowId })}
                         onPrint={() => printCard(g)}
+                        onWhatsApp={() => setWaFor({ group: g })}
                         isProc={isProc}
                         isDispatched={isDisp}
                         onMatReq={() => downloadMaterialRequirement([g], `${g.style_code} · ${g.color}`)}
@@ -381,6 +442,15 @@ export default function Production() {
         </div>
       )}
 
+      {waFor && (
+        <WhatsAppDialog
+          group={waFor.group}
+          workers={workers}
+          onClose={() => setWaFor(null)}
+          onSend={(phone) => shareViaWhatsApp(waFor.group, phone)}
+        />
+      )}
+
       {bulkConfirm && (
         <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" data-testid="bulk-assign-dialog">
           <div className="bg-white border-2 border-slate-200 shadow-2xl w-full max-w-md">
@@ -415,7 +485,7 @@ export default function Production() {
 
 function ColorGroupCard(props) {
   const { group, style, stageColor, stageIdx, canEdit, onMove, onToggleComponent,
-    onOpenAssign, onOpenQty, onPrint, isProc, isDispatched, onMatReq,
+    onOpenAssign, onOpenQty, onPrint, onWhatsApp, isProc, isDispatched, onMatReq,
     procSelected, onToggleProcSelect, isSelected, onToggleSelect, onDownloadInvoice } = props;
   const nextStage = STAGES[stageIdx + 1];
   const prevStage = STAGES[stageIdx - 1];
@@ -432,9 +502,22 @@ function ColorGroupCard(props) {
 
   const completedTotal = group.rows.reduce((s, r) => s + (r.completed_qty || 0), 0);
   const a = group.assignments || {};
+  const overdue = (group.overdueHours || 0) > 0;
 
   return (
-    <Card className="border-l-4 hover:border-[#C27842] transition-colors" style={{ borderLeftColor: stageColor }} data-testid={`group-${group.key}`}>
+    <Card
+      className={`border-l-4 hover:border-[#C27842] transition-colors ${overdue ? "ring-2 ring-red-500 ring-inset" : ""}`}
+      style={{ borderLeftColor: overdue ? "#DC2626" : stageColor }}
+      data-testid={`group-${group.key}`}
+    >
+      {overdue && (
+        <div className="bg-red-600 text-white px-3 py-1 flex items-center justify-between text-[10px] uppercase tracking-wider font-bold" data-testid={`overdue-${group.key}`}>
+          <span className="flex items-center gap-1"><AlertTriangle className="w-3 h-3" /> OVERDUE</span>
+          <span className="font-mono">
+            {group.overdueHours >= 24 ? `${(group.overdueHours / 24).toFixed(1)} d late` : `${group.overdueHours.toFixed(1)} h late`}
+          </span>
+        </div>
+      )}
       {style?.image_url && (
         <div className="h-28 bg-slate-100 border-b border-slate-200 overflow-hidden">
           <img src={style.image_url} alt={style.name} className="w-full h-full object-cover" data-testid={`card-img-${group.key}`} />
@@ -554,6 +637,12 @@ function ColorGroupCard(props) {
             <button onClick={onPrint} title="Print production card" data-testid={`print-${group.key}`}
               className="text-[10px] uppercase tracking-wider font-bold text-slate-700 hover:text-white hover:bg-[#0F172A] border border-slate-300 px-2 py-1 flex items-center gap-1">
               <Printer className="w-3 h-3" /> Print
+            </button>
+          )}
+          {canEdit && (
+            <button onClick={onWhatsApp} title="Share via WhatsApp" data-testid={`whatsapp-${group.key}`}
+              className="text-[10px] uppercase tracking-wider font-bold text-white bg-[#25D366] hover:bg-[#1DA851] border border-[#25D366] px-2 py-1 flex items-center gap-1">
+              <MessageCircle className="w-3 h-3" /> WhatsApp
             </button>
           )}
           {isProc && (
@@ -731,6 +820,91 @@ function QuantityDialog({ group, row, onSave, onClose }) {
           </div>
           <div className="flex gap-2 pt-3 border-t border-slate-200">
             <BtnPrimary onClick={save} data-testid="qty-save"><Check className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Save</BtnPrimary>
+            <BtnSecondary onClick={onClose}>Cancel</BtnSecondary>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+function WhatsAppDialog({ group, workers, onClose, onSend }) {
+  // Pull phones from any karigar assigned on this card; allow custom too.
+  const assigned = Object.values(group.assignments || {})
+    .map(a => a?.worker_id)
+    .filter(Boolean);
+  const candidates = workers.filter(w => assigned.includes(w.id) && (w.phone || "").trim());
+  const fallback = workers.filter(w => (w.phone || "").trim() && !candidates.find(c => c.id === w.id));
+  const [phone, setPhone] = useState(candidates[0]?.phone || "");
+  const [picked, setPicked] = useState(candidates[0]?.id || "");
+
+  const pick = (w) => { setPicked(w.id); setPhone(w.phone); };
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" data-testid="whatsapp-dialog">
+      <div className="bg-white border-2 border-slate-200 shadow-2xl w-full max-w-lg">
+        <div className="px-5 py-4 border-b-2 border-slate-200 flex items-center justify-between" style={{ background: "#25D366", color: "white" }}>
+          <div>
+            <div className="text-[10px] uppercase tracking-[0.2em] font-bold opacity-90">Share via WhatsApp</div>
+            <div className="font-bold text-base">{group.style_code} · {group.color} · {group.totalQty} pairs</div>
+          </div>
+          <button onClick={onClose} className="p-1 hover:bg-white/20"><X className="w-5 h-5" /></button>
+        </div>
+        <div className="p-5 space-y-4">
+          <div className="text-xs text-slate-600 leading-relaxed bg-amber-50 border border-amber-200 px-3 py-2">
+            The PDF will be <b>auto-downloaded</b> to your computer. WhatsApp Web will open with a pre-filled message. <b>Drag the downloaded PDF into the chat</b> to send it.
+          </div>
+
+          {candidates.length > 0 && (
+            <div>
+              <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Assigned karigars on this card</label>
+              <div className="space-y-1 mt-1">
+                {candidates.map(w => (
+                  <button key={w.id} onClick={() => pick(w)} data-testid={`wa-pick-${w.id}`}
+                    className={`w-full flex items-center justify-between px-3 py-2 border-2 text-left ${picked === w.id ? "border-[#25D366] bg-green-50" : "border-slate-200 hover:border-slate-400"}`}>
+                    <div>
+                      <div className="font-bold text-sm">{w.name}</div>
+                      <div className="text-[10px] uppercase tracking-wider text-slate-500">{w.skill}</div>
+                    </div>
+                    <div className="font-mono text-xs">{w.phone}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {fallback.length > 0 && (
+            <details>
+              <summary className="text-[10px] uppercase tracking-wider font-bold text-slate-600 cursor-pointer">Other karigars</summary>
+              <div className="space-y-1 mt-1 max-h-40 overflow-y-auto">
+                {fallback.map(w => (
+                  <button key={w.id} onClick={() => pick(w)} data-testid={`wa-pick-other-${w.id}`}
+                    className={`w-full flex items-center justify-between px-3 py-2 border text-left text-sm ${picked === w.id ? "border-[#25D366] bg-green-50" : "border-slate-200 hover:border-slate-400"}`}>
+                    <span><b>{w.name}</b> <span className="text-slate-500 text-xs">{w.skill}</span></span>
+                    <span className="font-mono text-xs">{w.phone}</span>
+                  </button>
+                ))}
+              </div>
+            </details>
+          )}
+
+          <div>
+            <label className="text-[10px] uppercase tracking-wider font-bold text-slate-600">Phone number</label>
+            <input
+              value={phone} onChange={(e) => { setPhone(e.target.value); setPicked(""); }}
+              placeholder="+91 98765 43210 (or leave blank to pick chat in WhatsApp)"
+              data-testid="wa-phone-input"
+              className="w-full mt-1 border-2 border-slate-300 px-3 py-2 font-mono text-sm focus:border-[#25D366] focus:outline-none"
+            />
+            <div className="text-[10px] text-slate-500 mt-1">10-digit Indian numbers will be auto-prefixed with +91.</div>
+          </div>
+
+          <div className="flex gap-2 pt-3 border-t border-slate-200">
+            <BtnPrimary onClick={() => onSend(phone)} data-testid="wa-send"
+              className="bg-[#25D366] border-[#25D366] hover:bg-[#1DA851]">
+              <MessageCircle className="w-3.5 h-3.5 inline -mt-0.5 mr-1" /> Download PDF & open WhatsApp
+            </BtnPrimary>
             <BtnSecondary onClick={onClose}>Cancel</BtnSecondary>
           </div>
         </div>

@@ -62,7 +62,7 @@ export default function Payroll() {
       setAdvForm(null);
       await loadAdvances();
       load();
-      if (ledgerFor) openLedger(ledgerFor);
+      if (ledgerFor) openLedger(ledgerFor.row);
     } catch (e) { alert(e.response?.data?.detail || e.message); }
   };
   const toggleSettled = async (adv) => {
@@ -75,7 +75,7 @@ export default function Payroll() {
     await http.delete(`/advances/${adv.id}`);
     await loadAdvances();
     load();
-    if (ledgerFor) openLedger(ledgerFor);
+    if (ledgerFor) openLedger(ledgerFor.row);
   };
 
   const openLedger = async (row) => {

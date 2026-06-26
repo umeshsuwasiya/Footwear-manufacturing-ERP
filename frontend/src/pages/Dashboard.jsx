@@ -1,31 +1,37 @@
 import { useEffect, useState } from "react";
 import { http, inr } from "../lib/api";
-import { PageHeader, StatTile, Card, BtnSecondary, Badge } from "../components/ui-kit";
+import { PageHeader, StatTile, Card, BtnSecondary } from "../components/ui-kit";
 import { Link } from "react-router-dom";
 import { useAuth } from "../lib/auth";
+import { AlertTriangle, Clock, ArrowRight } from "lucide-react";
 
 const STAGE_COLORS = {
-  cutting: "#2563EB", fitting: "#0284C7", pasting: "#C27842",
-  finishing: "#F59E0B", packing: "#16A34A", dispatched: "#F97316",
+  procurement: "#64748B", cutting: "#2563EB", folding: "#0284C7",
+  attachment: "#7C3AED", stitching: "#C27842", lasting: "#A65D24",
+  sole_pasting: "#F59E0B", finishing: "#16A34A", dispatched: "#F97316",
+};
+
+const STAGE_LABEL = {
+  procurement: "Procurement", cutting: "Cutting", folding: "Folding",
+  attachment: "Attachment", stitching: "Stitching", lasting: "Lasting",
+  sole_pasting: "Sole Pasting", finishing: "Finishing", dispatched: "Dispatched",
 };
 
 export default function Dashboard() {
   const [stats, setStats] = useState(null);
+  const [overdue, setOverdue] = useState([]);
   const { user } = useAuth();
 
   useEffect(() => {
     http.get("/dashboard/stats").then((r) => setStats(r.data)).catch(() => {});
+    http.get("/dashboard/overdue").then((r) => setOverdue(r.data || [])).catch(() => {});
   }, []);
 
   const seedDemo = async () => {
-    try {
-      await http.post("/seed/demo");
-      window.location.reload();
-    } catch {}
+    try { await http.post("/seed/demo"); window.location.reload(); } catch {}
   };
 
   if (!stats) return <div className="p-8 text-sm text-slate-500">Loading factory data...</div>;
-
   const maxStage = Math.max(...Object.values(stats.stage_counts), 1);
 
   return (
@@ -46,6 +52,47 @@ export default function Dashboard() {
       />
 
       <div className="p-8 space-y-6">
+        {overdue.length > 0 && (
+          <Card className="bg-red-50 border-2 border-red-300 overflow-hidden" data-testid="overdue-alert-banner">
+            <div className="bg-red-600 text-white px-5 py-2 flex items-baseline justify-between">
+              <div className="flex items-center gap-2 font-bold uppercase tracking-wider text-xs">
+                <AlertTriangle className="w-4 h-4" /> {overdue.length} Overdue Production Task{overdue.length > 1 ? "s" : ""}
+              </div>
+              <Link to="/production" className="text-[10px] uppercase tracking-wider font-bold hover:underline flex items-center gap-1">
+                Open production floor <ArrowRight className="w-3 h-3" />
+              </Link>
+            </div>
+            <div className="max-h-72 overflow-y-auto">
+              <table className="w-full text-xs" data-testid="overdue-table">
+                <thead className="bg-red-100 sticky top-0">
+                  <tr className="text-left text-[10px] uppercase tracking-wider text-red-800 border-b border-red-200">
+                    <th className="px-4 py-2 font-bold">PO</th>
+                    <th className="px-4 py-2 font-bold">Style</th>
+                    <th className="px-4 py-2 font-bold">Color · Size</th>
+                    <th className="px-4 py-2 font-bold">Stage</th>
+                    <th className="px-4 py-2 font-bold text-right">Pairs</th>
+                    <th className="px-4 py-2 font-bold text-right">Overdue by</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {overdue.slice(0, 50).map((j) => (
+                    <tr key={j.id} className="border-b border-red-100 hover:bg-red-100/60" data-testid={`overdue-row-${j.id}`}>
+                      <td className="px-4 py-2 font-mono font-bold">{j.po_number}</td>
+                      <td className="px-4 py-2 font-mono">{j.style_code}</td>
+                      <td className="px-4 py-2">{j.color || "—"} · {j.size || "—"}</td>
+                      <td className="px-4 py-2 uppercase font-bold" style={{ color: STAGE_COLORS[j.stage] }}>{STAGE_LABEL[j.stage] || j.stage}</td>
+                      <td className="px-4 py-2 text-right font-mono">{j.quantity}</td>
+                      <td className="px-4 py-2 text-right font-mono font-bold text-red-700">
+                        {j.overdue_hours >= 24 ? `${(j.overdue_hours / 24).toFixed(1)} d` : `${j.overdue_hours.toFixed(1)} h`}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        )}
+
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <StatTile testId="stat-active-pos" label="Active POs" value={stats.total_pos} sub={`${stats.pending_pos} pending`} accent="#0F172A" />
           <StatTile testId="stat-wip" label="Pairs in WIP" value={stats.pairs_in_wip} sub="across all stages" accent="#C27842" />
@@ -63,14 +110,12 @@ export default function Dashboard() {
               {Object.entries(stats.stage_counts).map(([stage, count]) => (
                 <div key={stage}>
                   <div className="flex items-baseline justify-between mb-1">
-                    <span className="text-xs uppercase tracking-wider font-bold">{stage}</span>
+                    <span className="text-xs uppercase tracking-wider font-bold">{STAGE_LABEL[stage] || stage}</span>
                     <span className="font-mono text-sm font-bold">{count}</span>
                   </div>
                   <div className="h-6 bg-slate-100 relative overflow-hidden">
-                    <div
-                      className="h-full transition-all"
-                      style={{ width: `${(count / maxStage) * 100}%`, background: STAGE_COLORS[stage] }}
-                    />
+                    <div className="h-full transition-all"
+                      style={{ width: `${(count / maxStage) * 100}%`, background: STAGE_COLORS[stage] || "#94A3B8" }} />
                   </div>
                 </div>
               ))}
@@ -78,16 +123,18 @@ export default function Dashboard() {
           </Card>
 
           <Card className="p-6">
-            <h2 className="text-xl font-bold mb-4">Quick Stats</h2>
+            <h2 className="text-xl font-bold mb-4 flex items-center gap-2"><Clock className="w-4 h-4 text-[#C27842]" /> Quick Stats</h2>
             <div className="space-y-3 text-sm">
               <Row label="Materials" value={stats.materials_count} />
               <Row label="Styles" value={stats.styles_count} />
               <Row label="Total POs" value={stats.total_pos} />
               <Row label="Pending POs" value={stats.pending_pos} />
+              <Row label="Overdue Jobs" value={overdue.length} highlight={overdue.length > 0} />
             </div>
             <div className="mt-6 pt-4 border-t border-slate-200 space-y-2">
               <Link to="/pos" className="block text-xs uppercase tracking-wider font-bold text-[#2563EB] hover:underline">→ Manage Purchase Orders</Link>
               <Link to="/production" className="block text-xs uppercase tracking-wider font-bold text-[#C27842] hover:underline">→ View Production Board</Link>
+              <Link to="/reports" className="block text-xs uppercase tracking-wider font-bold text-[#16A34A] hover:underline">→ View Visual Reports</Link>
             </div>
           </Card>
         </div>
@@ -127,11 +174,11 @@ export default function Dashboard() {
   );
 }
 
-function Row({ label, value }) {
+function Row({ label, value, highlight = false }) {
   return (
     <div className="flex items-baseline justify-between border-b border-dashed border-slate-200 pb-2">
       <span className="text-xs uppercase tracking-wider text-slate-500 font-bold">{label}</span>
-      <span className="font-mono font-bold">{value}</span>
+      <span className={`font-mono font-bold ${highlight ? "text-red-600 text-lg" : ""}`}>{value}</span>
     </div>
   );
 }

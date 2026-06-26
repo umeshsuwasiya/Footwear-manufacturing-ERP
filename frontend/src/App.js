@@ -15,6 +15,7 @@ import Production from "@/pages/Production";
 import Defects from "@/pages/Defects";
 import Reports from "@/pages/Reports";
 import Users from "@/pages/Users";
+import Settings from "@/pages/Settings";
 import { Loader2 } from "lucide-react";
 
 function Protected({ children }) {
@@ -49,6 +50,7 @@ function App() {
             <Route path="production" element={<Production />} />
             <Route path="defects" element={<Defects />} />
             <Route path="reports" element={<Reports />} />
+            <Route path="settings" element={<Settings />} />
             <Route path="users" element={<Users />} />
           </Route>
         </Routes>
