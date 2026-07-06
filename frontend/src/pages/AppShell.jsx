@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useAuth } from "../lib/auth";
-import { LayoutDashboard, Boxes, Layers, Calculator, FileText, Hammer, Users, LogOut, Factory, AlertOctagon, BarChart3, HardHat, Warehouse, IndianRupee, Settings as SettingsIcon, Receipt, BookOpen, Truck, Menu, X, ArrowLeftRight, ShoppingBag } from "lucide-react";
+import { LayoutDashboard, Boxes, Layers, Calculator, FileText, Hammer, Users, LogOut, Factory, AlertOctagon, BarChart3, HardHat, Warehouse, IndianRupee, Settings as SettingsIcon, Receipt, BookOpen, Truck, Menu, X, ArrowLeftRight, ShoppingBag, Package } from "lucide-react";
 
 const navGroups = [
   {
@@ -13,6 +13,7 @@ const navGroups = [
       { to: "/styles", label: "Styles", icon: Layers, roles: ["admin", "manager", "sales"] },
       { to: "/materials", label: "Materials", icon: Boxes, roles: ["admin", "manager"] },
       { to: "/inventory", label: "Raw Material Inventory", icon: Warehouse, roles: ["admin", "manager", "production"] },
+      { to: "/components", label: "Component Inventory", icon: Package, roles: ["admin", "manager", "production"] },
       { to: "/workers", label: "Workers", icon: HardHat, roles: ["admin", "manager", "production"] },
       { to: "/payroll", label: "Payroll", icon: IndianRupee, roles: ["admin", "manager"] },
       { to: "/settings", label: "Settings", icon: SettingsIcon, roles: ["admin", "manager"] },

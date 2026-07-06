@@ -9,7 +9,7 @@ import logging
 import asyncio
 import httpx
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Literal, Dict
+from typing import List, Optional, Literal, Dict, Any
 
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, UploadFile, File, Query
 from starlette.middleware.cors import CORSMiddleware
@@ -591,6 +591,108 @@ class StyleLifecycleUpsert(BaseModel):
 class OnlineStatusPatchIn(BaseModel):
     to_status: OnlineStatus
     notes:     Optional[str] = ""
+
+
+# ---------- Component master / movements / BOM mapping (Phase 1) ----------
+COMPONENT_CATEGORIES = [
+    "Upper", "Sole", "Insole", "Sockliner", "Bottom",
+    "Lace", "Box", "Tag", "Label", "Packaging", "Other",
+]
+
+# All movement types this ledger accepts.
+#   purchase_in         → + current_stock  (no reservation involvement)
+#   return_in           → + current_stock
+#   adjustment          → +/- signed delta on current_stock  (positive quantity + direction)
+#   production_reserve  → + reserved_stock (current_stock untouched)
+#   online_reserve      → + reserved_stock
+#   unreserve           → - reserved_stock
+#   production_issue    → - current_stock  AND - reserved_stock   (consume the reservation)
+#   online_issue        → - current_stock  AND - reserved_stock
+COMPONENT_MOVEMENT_TYPES = [
+    "purchase_in", "return_in", "adjustment",
+    "production_reserve", "online_reserve", "unreserve",
+    "production_issue", "online_issue",
+]
+
+
+class ComponentIn(BaseModel):
+    component_code:     str
+    component_name:     str
+    component_category: Literal[
+        "Upper", "Sole", "Insole", "Sockliner", "Bottom",
+        "Lace", "Box", "Tag", "Label", "Packaging", "Other",
+    ]
+    color:              Optional[str] = ""
+    size:               Optional[str] = ""
+    vendor:             Optional[str] = ""
+    unit:               Optional[str] = "pair"
+    current_stock:      int = 0        # accepted at create time, becomes opening balance
+    reorder_level:      int = 0
+    minimum_stock:      int = 0
+    lead_time_days:     int = 0
+    active:             bool = True
+
+
+class ComponentUpdate(BaseModel):
+    component_name:     Optional[str] = None
+    component_category: Optional[Literal[
+        "Upper", "Sole", "Insole", "Sockliner", "Bottom",
+        "Lace", "Box", "Tag", "Label", "Packaging", "Other",
+    ]] = None
+    vendor:             Optional[str] = None
+    unit:               Optional[str] = None
+    reorder_level:      Optional[int] = None
+    minimum_stock:      Optional[int] = None
+    lead_time_days:     Optional[int] = None
+    active:             Optional[bool] = None
+
+
+class ComponentBulkMatrix(BaseModel):
+    """Create multiple rows for one component_code across a color x size matrix.
+    Mirrors the AddStockDrawer matrix in the Ready Stock UI."""
+    component_code:     str
+    component_name:     str
+    component_category: Literal[
+        "Upper", "Sole", "Insole", "Sockliner", "Bottom",
+        "Lace", "Box", "Tag", "Label", "Packaging", "Other",
+    ]
+    vendor:             Optional[str] = ""
+    unit:               Optional[str] = "pair"
+    reorder_level:      int = 0
+    minimum_stock:      int = 0
+    lead_time_days:     int = 0
+    # rows shape: [{color, size, opening_qty}]  — opening_qty defaults 0 if omitted
+    rows: List[Dict[str, Any]]
+
+
+class ComponentMovementIn(BaseModel):
+    component_id:   str
+    movement_type:  Literal[
+        "purchase_in", "return_in", "adjustment",
+        "production_reserve", "online_reserve", "unreserve",
+        "production_issue", "online_issue",
+    ]
+    quantity:       int
+    # signed direction is only used with 'adjustment'
+    adjustment_dir: Optional[Literal["increase", "decrease"]] = None
+    reference_type: Optional[str] = "manual"    # e.g. "PO", "style", "production_job", "online_order"
+    reference_id:   Optional[str] = ""
+    style_id:       Optional[str] = ""          # optional linkage
+    notes:          Optional[str] = ""
+
+
+class StyleComponentMappingIn(BaseModel):
+    style_id:           str
+    component_id:       str
+    quantity_per_pair:  float = 1.0
+    wastage_percent:    float = 0.0
+    active:             bool  = True
+
+
+class StyleComponentMappingUpdate(BaseModel):
+    quantity_per_pair:  Optional[float] = None
+    wastage_percent:    Optional[float] = None
+    active:             Optional[bool]  = None
 
 
 class FgInventoryIn(BaseModel):
@@ -1560,6 +1662,439 @@ async def list_online_styles(
         return (idx, row["style_code"] or "")
     out.sort(key=sort_key)
     return out
+
+
+# ---------- COMPONENT INVENTORY (Phase 1) ----------
+#
+# Global component inventory. A "component" is one row per
+# (component_code, color, size) tuple — mirroring the fg_inventory
+# color x size matrix shown on Ready Stock. Stock counters are
+# maintained ONLY by writing entries into component_stock_movements.
+#
+#   available_stock = current_stock - reserved_stock
+#
+# Reservation records go into a separate collection in Phase 2; here
+# we just maintain the aggregate reserved_stock counter on the row.
+
+def _serialize_component(doc: dict) -> dict:
+    """Attach the derived available_stock field before returning to clients."""
+    out = stringify(doc)
+    out["available_stock"] = int(out.get("current_stock", 0)) - int(out.get("reserved_stock", 0))
+    return out
+
+
+def _apply_component_movement(mov_type: str, quantity: int,
+                              adjustment_dir: Optional[str]) -> Dict[str, int]:
+    """Return the {current_delta, reserved_delta} that this movement should
+    apply to the component_master row. Signed integers."""
+    q = int(quantity)
+    if q <= 0:
+        raise HTTPException(400, "quantity must be a positive integer")
+
+    if mov_type == "purchase_in":
+        return {"current_delta":  q,  "reserved_delta":  0}
+    if mov_type == "return_in":
+        return {"current_delta":  q,  "reserved_delta":  0}
+    if mov_type == "adjustment":
+        if adjustment_dir not in ("increase", "decrease"):
+            raise HTTPException(400, "adjustment requires adjustment_dir='increase' or 'decrease'")
+        sign = 1 if adjustment_dir == "increase" else -1
+        return {"current_delta": sign * q, "reserved_delta": 0}
+    if mov_type in ("production_reserve", "online_reserve"):
+        return {"current_delta": 0,  "reserved_delta":  q}
+    if mov_type == "unreserve":
+        return {"current_delta": 0,  "reserved_delta": -q}
+    if mov_type in ("production_issue", "online_issue"):
+        # Consume the reservation: both current and reserved go down.
+        return {"current_delta": -q, "reserved_delta": -q}
+    raise HTTPException(400, f"Unsupported movement_type '{mov_type}'")
+
+
+async def _record_component_movement(component: dict, payload: ComponentMovementIn,
+                                     user_email: str) -> dict:
+    """Atomically apply a movement to a component row and write a ledger entry.
+    Rejects the movement if it would produce a negative current_stock or reserved_stock."""
+    delta = _apply_component_movement(payload.movement_type, payload.quantity,
+                                      payload.adjustment_dir)
+    new_current  = int(component.get("current_stock",  0)) + delta["current_delta"]
+    new_reserved = int(component.get("reserved_stock", 0)) + delta["reserved_delta"]
+
+    if new_current < 0:
+        raise HTTPException(400,
+            f"Movement would take current_stock negative ({component.get('current_stock', 0)} → {new_current})")
+    if new_reserved < 0:
+        raise HTTPException(400,
+            f"Movement would take reserved_stock negative ({component.get('reserved_stock', 0)} → {new_reserved})")
+    if new_reserved > new_current:
+        raise HTTPException(400,
+            f"Movement would over-reserve: reserved_stock ({new_reserved}) > current_stock ({new_current})")
+
+    now = now_iso()
+    await db.component_master.update_one(
+        {"_id": component["_id"]},
+        {"$set": {
+            "current_stock":  new_current,
+            "reserved_stock": new_reserved,
+            "updated_at":     now,
+        }}
+    )
+
+    ledger = {
+        "component_id":   component["_id"],
+        "component_code": component.get("component_code", ""),
+        "component_name": component.get("component_name", ""),
+        "color":          component.get("color", ""),
+        "size":           component.get("size", ""),
+        "movement_type":  payload.movement_type,
+        "quantity":       int(payload.quantity),
+        "current_delta":  delta["current_delta"],
+        "reserved_delta": delta["reserved_delta"],
+        "current_before": int(component.get("current_stock",  0)),
+        "current_after":  new_current,
+        "reserved_before":int(component.get("reserved_stock", 0)),
+        "reserved_after": new_reserved,
+        "reference_type": payload.reference_type or "manual",
+        "reference_id":   payload.reference_id or "",
+        "style_id":       oid(payload.style_id) if payload.style_id else None,
+        "notes":          (payload.notes or "").strip(),
+        "created_at":     now,
+        "by":             user_email,
+    }
+    res = await db.component_stock_movements.insert_one(ledger)
+    ledger["_id"] = res.inserted_id
+
+    await log_activity(
+        "MOVEMENT", "component",
+        f"{component.get('component_code')} ({component.get('color','') or '—'}/{component.get('size','') or '—'}): "
+        f"{payload.movement_type} x {payload.quantity} → stock={new_current}, reserved={new_reserved}",
+        user_email,
+    )
+    return {"ledger": stringify(ledger), "component": _serialize_component({**component,
+        "current_stock":  new_current,
+        "reserved_stock": new_reserved,
+        "updated_at":     now,
+    })}
+
+
+# ── Endpoints ──────────────────────────────────────────────────────
+
+@api.get("/components")
+async def list_components(
+    request: Request,
+    code:       Optional[str] = None,
+    category:   Optional[str] = None,
+    color:      Optional[str] = None,
+    size:       Optional[str] = None,
+    active:     Optional[bool] = None,
+    low_stock:  Optional[bool] = None,
+    search:     Optional[str] = None,
+):
+    """Return a flat list of component rows. UI groups them by component_code
+    (each group renders as a color x size matrix)."""
+    await get_current_user(request)
+    q: dict = {}
+    if code:     q["component_code"] = code
+    if category: q["component_category"] = category
+    if color:    q["color"] = color
+    if size:     q["size"] = size
+    if active is not None: q["active"] = active
+    if search:
+        rx = {"$regex": re.escape(search), "$options": "i"}
+        q["$or"] = [{"component_code": rx}, {"component_name": rx}, {"vendor": rx}]
+
+    rows = await db.component_master.find(q).sort([("component_code", 1), ("color", 1), ("size", 1)]).to_list(10000)
+    result = [_serialize_component(r) for r in rows]
+    if low_stock:
+        # a row is "low" when available_stock <= minimum_stock (and minimum_stock > 0)
+        result = [r for r in result
+                  if int(r.get("minimum_stock", 0)) > 0
+                  and int(r.get("available_stock", 0)) <= int(r.get("minimum_stock", 0))]
+    return result
+
+
+@api.post("/components")
+async def create_component(payload: ComponentIn, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    now = now_iso()
+    doc = {
+        **payload.model_dump(),
+        "reserved_stock": 0,
+        "created_at":     now,
+        "updated_at":     now,
+        "created_by":     u["email"],
+    }
+    # Enforce non-negative counters
+    if int(doc["current_stock"]) < 0:
+        raise HTTPException(400, "current_stock must be >= 0")
+    try:
+        res = await db.component_master.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409,
+            f"A component with code='{payload.component_code}', color='{payload.color or ''}', "
+            f"size='{payload.size or ''}' already exists")
+    doc["_id"] = res.inserted_id
+
+    # If we're given a non-zero opening stock, write a ledger row so the audit trail is complete
+    if int(payload.current_stock) > 0:
+        opening = ComponentMovementIn(
+            component_id=str(res.inserted_id),
+            movement_type="purchase_in",
+            quantity=int(payload.current_stock),
+            reference_type="opening_balance",
+            notes="Opening balance at row creation",
+        )
+        # We just inserted so read back the row and record the movement in an idempotent way.
+        # But the movement helper expects the "before" values; since the row already has
+        # current_stock set to opening, temporarily rewind before applying.
+        rewound = {**doc, "current_stock": 0, "reserved_stock": 0}
+        # Rewind on DB too, so helper's write of new_current computes correctly
+        await db.component_master.update_one({"_id": res.inserted_id},
+            {"$set": {"current_stock": 0, "reserved_stock": 0}})
+        await _record_component_movement(rewound, opening, u["email"])
+
+    fresh = await db.component_master.find_one({"_id": res.inserted_id})
+    await log_activity("CREATE", "component",
+        f"{payload.component_code} ({payload.color or '—'}/{payload.size or '—'}) created",
+        u["email"])
+    return _serialize_component(fresh)
+
+
+@api.put("/components/{cid}")
+async def update_component(cid: str, payload: ComponentUpdate, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    doc = await db.component_master.find_one({"_id": oid(cid)})
+    if not doc:
+        raise HTTPException(404, "Component not found")
+    update = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
+    if not update:
+        return _serialize_component(doc)
+    update["updated_at"] = now_iso()
+    await db.component_master.update_one({"_id": doc["_id"]}, {"$set": update})
+    await log_activity("UPDATE", "component",
+        f"{doc['component_code']} metadata updated: {', '.join(update.keys())}", u["email"])
+    return _serialize_component(await db.component_master.find_one({"_id": doc["_id"]}))
+
+
+@api.delete("/components/{cid}")
+async def deactivate_component(cid: str, request: Request):
+    """Soft-delete: set active=false. Refuses if the row has non-zero stock or open reservations."""
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    doc = await db.component_master.find_one({"_id": oid(cid)})
+    if not doc:
+        raise HTTPException(404, "Component not found")
+    if int(doc.get("current_stock", 0)) > 0 or int(doc.get("reserved_stock", 0)) > 0:
+        raise HTTPException(400,
+            "Cannot delete: component has non-zero stock. Zero out via an adjustment movement first.")
+    await db.component_master.update_one(
+        {"_id": doc["_id"]}, {"$set": {"active": False, "updated_at": now_iso()}}
+    )
+    await log_activity("DELETE", "component",
+        f"{doc['component_code']} ({doc.get('color','')}/{doc.get('size','')}) deactivated",
+        u["email"])
+    return {"ok": True, "id": cid}
+
+
+@api.post("/components/bulk-matrix")
+async def create_component_bulk_matrix(payload: ComponentBulkMatrix, request: Request):
+    """Create multiple (color, size) rows for one component in one shot.
+    Skips (color, size) pairs that already exist. Returns per-row status."""
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    now = now_iso()
+    created, skipped = 0, 0
+    results = []
+    for row in payload.rows:
+        color = str(row.get("color", "") or "").strip()
+        size  = str(row.get("size",  "") or "").strip()
+        opening = int(row.get("opening_qty") or 0)
+        if opening < 0:
+            results.append({"color": color, "size": size, "status": "invalid_qty"})
+            continue
+        try:
+            doc = {
+                "component_code":     payload.component_code,
+                "component_name":     payload.component_name,
+                "component_category": payload.component_category,
+                "color":              color,
+                "size":               size,
+                "vendor":             payload.vendor or "",
+                "unit":               payload.unit or "pair",
+                "current_stock":      0,
+                "reserved_stock":     0,
+                "reorder_level":      int(payload.reorder_level),
+                "minimum_stock":      int(payload.minimum_stock),
+                "lead_time_days":     int(payload.lead_time_days),
+                "active":             True,
+                "created_at":         now,
+                "updated_at":         now,
+                "created_by":         u["email"],
+            }
+            res = await db.component_master.insert_one(doc)
+            doc["_id"] = res.inserted_id
+            if opening > 0:
+                await _record_component_movement(
+                    doc,
+                    ComponentMovementIn(
+                        component_id=str(res.inserted_id),
+                        movement_type="purchase_in",
+                        quantity=opening,
+                        reference_type="opening_balance",
+                        notes="Opening balance from bulk matrix",
+                    ),
+                    u["email"],
+                )
+            created += 1
+            results.append({"color": color, "size": size, "status": "created"})
+        except DuplicateKeyError:
+            skipped += 1
+            results.append({"color": color, "size": size, "status": "exists"})
+    await log_activity("BULK", "component",
+        f"{payload.component_code}: {created} rows created, {skipped} skipped", u["email"])
+    return {"created": created, "skipped": skipped, "results": results}
+
+
+@api.post("/components/movements")
+async def post_component_movement(payload: ComponentMovementIn, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    comp = await db.component_master.find_one({"_id": oid(payload.component_id)})
+    if not comp:
+        raise HTTPException(404, "Component not found")
+    return await _record_component_movement(comp, payload, u["email"])
+
+
+@api.get("/components/movements")
+async def list_component_movements(
+    request: Request,
+    component_id:  Optional[str] = None,
+    movement_type: Optional[str] = None,
+    style_id:      Optional[str] = None,
+    reference_type: Optional[str] = None,
+    limit: int = 500,
+):
+    await get_current_user(request)
+    q: dict = {}
+    if component_id:  q["component_id"] = oid(component_id)
+    if movement_type: q["movement_type"] = movement_type
+    if style_id:      q["style_id"] = oid(style_id)
+    if reference_type: q["reference_type"] = reference_type
+    rows = await db.component_stock_movements.find(q).sort("created_at", -1).to_list(min(limit, 2000))
+    out = []
+    for r in rows:
+        s = stringify(r)
+        # Also stringify the embedded ObjectId fields we set with helpers
+        if isinstance(r.get("style_id"), ObjectId):
+            s["style_id"] = str(r["style_id"])
+        if isinstance(r.get("component_id"), ObjectId):
+            s["component_id"] = str(r["component_id"])
+        out.append(s)
+    return out
+
+
+# ---------- Style ⇄ Component BOM mapping ----------
+
+@api.get("/style-component-mapping")
+async def list_style_component_mapping(
+    request: Request,
+    style_id:     Optional[str] = None,
+    component_id: Optional[str] = None,
+):
+    await get_current_user(request)
+    q: dict = {}
+    if style_id:     q["style_id"] = oid(style_id)
+    if component_id: q["component_id"] = oid(component_id)
+    rows = await db.style_component_mapping.find(q).to_list(5000)
+
+    # Denormalise the component + style basics for display
+    comp_ids  = list({r["component_id"] for r in rows if r.get("component_id")})
+    style_ids = list({r["style_id"]     for r in rows if r.get("style_id")})
+    comps  = {c["_id"]: c for c in await db.component_master.find({"_id": {"$in": comp_ids}}).to_list(5000)}
+    styles = {s["_id"]: s for s in await db.styles.find({"_id": {"$in": style_ids}}).to_list(5000)}
+
+    out = []
+    for r in rows:
+        s = stringify(r)
+        s["style_id"]     = str(r.get("style_id"))     if r.get("style_id") else None
+        s["component_id"] = str(r.get("component_id")) if r.get("component_id") else None
+        comp  = comps.get(r.get("component_id"))
+        style = styles.get(r.get("style_id"))
+        if comp:
+            s["component_code"]     = comp.get("component_code", "")
+            s["component_name"]     = comp.get("component_name", "")
+            s["component_category"] = comp.get("component_category", "")
+            s["component_color"]    = comp.get("color", "")
+            s["component_size"]     = comp.get("size", "")
+            s["current_stock"]      = int(comp.get("current_stock", 0))
+            s["reserved_stock"]     = int(comp.get("reserved_stock", 0))
+            s["available_stock"]    = s["current_stock"] - s["reserved_stock"]
+        if style:
+            s["style_code"] = style.get("code", "")
+            s["style_name"] = style.get("name", "")
+        out.append(s)
+    # sort: style_code then component category then component_code
+    out.sort(key=lambda x: (x.get("style_code",""), x.get("component_category",""), x.get("component_code","")))
+    return out
+
+
+@api.post("/style-component-mapping")
+async def create_style_component_mapping(payload: StyleComponentMappingIn, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    style = await db.styles.find_one({"_id": oid(payload.style_id)})
+    if not style:
+        raise HTTPException(404, "Style not found")
+    comp = await db.component_master.find_one({"_id": oid(payload.component_id)})
+    if not comp:
+        raise HTTPException(404, "Component not found")
+    now = now_iso()
+    doc = {
+        "style_id":           oid(payload.style_id),
+        "component_id":       oid(payload.component_id),
+        "component_category": comp.get("component_category", ""),   # denormalised for readability
+        "quantity_per_pair":  float(payload.quantity_per_pair),
+        "wastage_percent":    float(payload.wastage_percent),
+        "active":             bool(payload.active),
+        "created_at":         now,
+        "updated_at":         now,
+        "created_by":         u["email"],
+    }
+    try:
+        res = await db.style_component_mapping.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409,
+            f"Style '{style['code']}' already has component '{comp['component_code']}' mapped.")
+    doc["_id"] = res.inserted_id
+    await log_activity("CREATE", "style_component_mapping",
+        f"{style['code']} ← {comp['component_code']} @ {payload.quantity_per_pair}/pair", u["email"])
+    s = stringify(doc)
+    s["style_id"]     = str(doc["style_id"])
+    s["component_id"] = str(doc["component_id"])
+    return s
+
+
+@api.put("/style-component-mapping/{mid}")
+async def update_style_component_mapping(mid: str, payload: StyleComponentMappingUpdate, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    doc = await db.style_component_mapping.find_one({"_id": oid(mid)})
+    if not doc:
+        raise HTTPException(404, "Mapping not found")
+    update = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
+    if not update:
+        return {"ok": True}
+    update["updated_at"] = now_iso()
+    await db.style_component_mapping.update_one({"_id": doc["_id"]}, {"$set": update})
+    await log_activity("UPDATE", "style_component_mapping",
+        f"Mapping {mid} updated: {', '.join(update.keys())}", u["email"])
+    return {"ok": True}
+
+
+@api.delete("/style-component-mapping/{mid}")
+async def delete_style_component_mapping(mid: str, request: Request):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    doc = await db.style_component_mapping.find_one({"_id": oid(mid)})
+    if not doc:
+        raise HTTPException(404, "Mapping not found")
+    await db.style_component_mapping.delete_one({"_id": doc["_id"]})
+    await log_activity("DELETE", "style_component_mapping",
+        f"Mapping {mid} deleted", u["email"])
+    return {"ok": True}
 
 
 # ---------- FINISHED GOODS INVENTORY & RESERVATION ENGINE ----------
@@ -6061,6 +6596,37 @@ async def on_startup():
         await db.style_lifecycle.create_index("online_status", name="style_lifecycle_status")
     except Exception as e:
         log.warning(f"Could not create style_lifecycle indexes: {e}")
+
+    # Component master: unique (code, color, size). Category & active for fast filter.
+    try:
+        await db.component_master.create_index(
+            [("component_code", 1), ("color", 1), ("size", 1)],
+            unique=True, name="component_master_unique"
+        )
+        await db.component_master.create_index("component_category", name="component_master_category")
+        await db.component_master.create_index("active", name="component_master_active")
+    except Exception as e:
+        log.warning(f"Could not create component_master indexes: {e}")
+
+    # Component stock movements ledger: hot queries are by component + time and by style.
+    try:
+        await db.component_stock_movements.create_index([("component_id", 1), ("created_at", -1)],
+                                                       name="component_moves_by_component")
+        await db.component_stock_movements.create_index("movement_type", name="component_moves_type")
+        await db.component_stock_movements.create_index("style_id", name="component_moves_style")
+        await db.component_stock_movements.create_index("created_at", name="component_moves_created")
+    except Exception as e:
+        log.warning(f"Could not create component_stock_movements indexes: {e}")
+
+    # Style ⇄ component mapping: one row per (style, component); reverse-index for shared components.
+    try:
+        await db.style_component_mapping.create_index(
+            [("style_id", 1), ("component_id", 1)],
+            unique=True, name="style_component_mapping_unique"
+        )
+        await db.style_component_mapping.create_index("component_id", name="style_component_mapping_component")
+    except Exception as e:
+        log.warning(f"Could not create style_component_mapping indexes: {e}")
 
     # fg_inventory unique index
     try:
