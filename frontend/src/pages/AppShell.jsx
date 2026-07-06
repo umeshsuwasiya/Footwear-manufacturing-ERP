@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { useAuth } from "../lib/auth";
-import { LayoutDashboard, Boxes, Layers, Calculator, FileText, Hammer, Users, LogOut, Factory, AlertOctagon, BarChart3, HardHat, Warehouse, IndianRupee, Settings as SettingsIcon, Receipt, BookOpen, Truck, Menu, X, ArrowLeftRight, ShoppingBag, Package } from "lucide-react";
+import { LayoutDashboard, Boxes, Layers, Calculator, FileText, Hammer, Users, LogOut, Factory, AlertOctagon, BarChart3, HardHat, Warehouse, IndianRupee, Settings as SettingsIcon, Receipt, BookOpen, Truck, Menu, X, ArrowLeftRight, ShoppingBag, Package, ClipboardList, QrCode, PackageOpen } from "lucide-react";
 
 const navGroups = [
   {
@@ -44,6 +44,10 @@ const navGroups = [
       { to: "/sku-map", label: "SKU Mapping", icon: ArrowLeftRight, roles: ["admin", "manager"] },
       { to: "/ready-stock", label: "Ready Stock", icon: Boxes, roles: ["admin", "manager"] },
       { to: "/online-orders", label: "Online Orders", icon: ShoppingBag, roles: ["admin", "manager", "sales"] },
+      { to: "/warehouse", label: "Warehouse", icon: Warehouse, roles: ["admin", "manager", "production"] },
+      { to: "/picklists", label: "Picklists", icon: ClipboardList, roles: ["admin", "manager", "production"] },
+      { to: "/warehouse/reports", label: "Warehouse Reports", icon: BarChart3, roles: ["admin", "manager"] },
+      { to: "/pending-list", label: "Pending Product List", icon: PackageOpen, roles: ["admin", "manager", "production"] },
       { to: "/dispatch", label: "Dispatch", icon: Truck, roles: ["admin", "manager", "production"] },
       { to: "/returns", label: "Returns", icon: AlertOctagon, roles: ["admin", "manager", "production"] },
       { to: "/settlements", label: "Settlements", icon: IndianRupee, roles: ["admin", "manager"] },

@@ -25,6 +25,11 @@ import OnlineStylePipeline from "@/pages/OnlineStylePipeline";
 import ComponentInventory from "@/pages/ComponentInventory";
 import OnlineOrders from "@/pages/OnlineOrders";
 import ReadyStock from "@/pages/ReadyStock";
+import WarehouseDashboard from "@/pages/WarehouseDashboard";
+import Picklists from "@/pages/Picklists";
+import WarehouseReports from "@/pages/WarehouseReports";
+import WarehouseQRSheet from "@/pages/WarehouseQRSheet";
+import PendingProductList from "@/pages/PendingProductList";
 import SelectWorkspace from "@/pages/SelectWorkspace";
 import { Loader2 } from "lucide-react";
 
@@ -77,6 +82,11 @@ function App() {
             <Route path="components" element={<ComponentInventory />} />
             <Route path="ready-stock" element={<ReadyStock />} />
             <Route path="online-orders" element={<OnlineOrders />} />
+            <Route path="warehouse" element={<WarehouseDashboard />} />
+            <Route path="picklists" element={<Picklists />} />
+            <Route path="warehouse/reports" element={<WarehouseReports />} />
+            <Route path="warehouse/qr" element={<WarehouseQRSheet />} />
+            <Route path="pending-list" element={<PendingProductList />} />
             <Route path="settings" element={<Settings />} />
             <Route path="users" element={<Users />} />
           </Route>

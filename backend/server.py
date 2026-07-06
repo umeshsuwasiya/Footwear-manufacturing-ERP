@@ -769,6 +769,37 @@ class InventoryReservationIn(BaseModel):
     online_order_id: str
 
 
+# ----- Warehouse Management (WMS) -----
+class PicklistItemIn(BaseModel):
+    style_id: Optional[str] = None
+    style_code: str
+    color: str
+    size: str
+    qty: int
+    location_code: str
+    rack: Optional[str] = None
+    row: Optional[int] = None
+    column: Optional[int] = None
+    picked: bool = False
+
+
+class PicklistIn(BaseModel):
+    order_id: str
+    channel: str
+    picker: Optional[str] = None
+    items: List[PicklistItemIn] = []
+
+
+class PickItemIn(BaseModel):
+    item_index: int
+    scanned_location: str
+
+
+class PicklistPatchIn(BaseModel):
+    picker: Optional[str] = None
+    status: Optional[Literal["pending", "in_progress", "completed", "cancelled"]] = None
+
+
 # Sensible factory defaults (in hours)
 DEFAULT_STAGE_HOURS = {
     "procurement": 24, "cutting": 24, "folding": 8, "attachment": 8,
@@ -2205,7 +2236,7 @@ async def _get_or_create_fg_row(style_id: str, color: str, size: str):
         })
 
 
-async def _apply_movement(payload: "FgStockMovementIn", user_email: str):
+async def _apply_movement(payload: "FgStockMovementIn", user_email: str, skip_location_sync: bool = False):
     """Single write path to fg_inventory. Creates a ledger row and updates the inventory
     row atomically. Blocks any movement that would push a field below zero.
 
@@ -2320,9 +2351,17 @@ async def _apply_movement(payload: "FgStockMovementIn", user_email: str):
     updated["available_qty"] = u_ready - u_res - u_dmg - u_liq
     updated["is_low_stock"]  = u_ready < u_min
 
+    # ── Warehouse location sync (Phase WMS) ─────────────────────────────
+    location_result = None
+    if not skip_location_sync:
+        try:
+            location_result = await _sync_warehouse_locations(payload, user_email)
+        except Exception as _wms_err:
+            log.warning(f"WMS sync failed for {payload.movement_type}: {_wms_err}")
+
     # Stringify movement doc for JSON response
     mv_out = stringify(mv_doc)
-    return {"inventory": updated, "movement": mv_out}
+    return {"inventory": updated, "movement": mv_out, "warehouse": location_result}
 
 
 @api.post("/fg-inventory/movements")
@@ -5128,6 +5167,11 @@ async def import_online_orders(
     imported = 0
     unresolved = 0
     errors = []
+    fulfilled_from_stock = 0
+    picklist_lines_by_order: Dict[str, List[dict]] = {}
+    # Track already-covered qty per SKU during this import batch, so order N doesn't
+    # over-claim stock that order N-1 has already been assigned in the same batch.
+    in_flight_covered: Dict[tuple, int] = {}
 
     durations = await _get_stage_durations()
 
@@ -5192,6 +5236,45 @@ async def import_online_orders(
         else:
             match_status = "matched"
 
+        # ── Check FG stock coverage from fg_location_inventory (WMS) ─────────
+        try:
+            style_oid = ObjectId(result["style_id"])
+            covered_available = 0
+            async for loc in db.fg_location_inventory.find({
+                "style_id": style_oid,
+                "color": result["color"],
+                "size":  result["size"],
+                "qty":   {"$gt": 0},
+            }):
+                covered_available += max(0, int(loc.get("qty", 0)) - int(loc.get("reserved_qty", 0)))
+            sku_key = (result["style_id"], result["color"], result["size"])
+            already_in_batch = in_flight_covered.get(sku_key, 0)
+            free_available = max(0, covered_available - already_in_batch)
+        except Exception:
+            free_available = 0
+            sku_key = (result["style_id"], result["color"], result["size"])
+
+        covered_qty   = min(int(quantity), int(free_available))
+        remaining_qty = int(quantity) - covered_qty
+        if covered_qty > 0:
+            in_flight_covered[sku_key] = in_flight_covered.get(sku_key, 0) + covered_qty
+
+        if covered_qty > 0:
+            # Buffer for picklist generation (per order_id) after loop finishes
+            picklist_lines_by_order.setdefault(order_id, []).append({
+                "style_id":   result["style_id"],
+                "style_code": result["style_code"],
+                "color":      result["color"],
+                "size":       result["size"],
+                "quantity":   covered_qty,
+            })
+
+        # If part or full remaining, still create production job for the remainder
+        if remaining_qty <= 0:
+            imported += 1
+            fulfilled_from_stock += covered_qty
+            continue
+
         job = {
             # Link to source — use order_id as po_number, channel as client_name
             "po_id":              None,          # no PO doc; this is a direct channel order
@@ -5211,9 +5294,11 @@ async def import_online_orders(
             "description":        description,
             "color":              result["color"],
             "size":               result["size"],
-            "quantity":           quantity,
+            "quantity":           remaining_qty,   # only what's NOT already covered from ready stock
+            "original_order_qty": quantity,
+            "fulfilled_from_stock_qty": covered_qty,
             "unit_price":         unit_price,
-            "amount":             round(unit_price * quantity, 2),
+            "amount":             round(unit_price * remaining_qty, 2),
             "completed_qty":      0,
             "rejected_qty":       0,
             "delivery_date":      delivery_date,
@@ -5225,24 +5310,45 @@ async def import_online_orders(
             "created_at":         now_iso(),
             "updated_at":         now_iso(),
             "history": [{"stage": "procurement", "at": now_iso(), "by": u["email"],
-                         "notes": f"Auto-created from {channel} CSV import"}],
+                         "notes": f"Auto-created from {channel} CSV import"
+                                  + (f" (partial: {covered_qty} pairs shipped from ready stock)" if covered_qty else "")}],
         }
         jobs_to_insert.append(job)
         imported += 1
+        fulfilled_from_stock += covered_qty
 
     if jobs_to_insert:
         await db.production_jobs.insert_many(jobs_to_insert)
 
+    # ── Auto-generate picklists per order_id (WMS integration) ───────────────
+    picklists_created = []
+    for oid_key, lines in picklist_lines_by_order.items():
+        try:
+            pl_doc, covered_map, uncovered_map = await _generate_picklist_for_order(
+                oid_key, channel, lines, u["email"])
+            if pl_doc.get("_id"):
+                picklists_created.append({
+                    "picklist_no": pl_doc.get("picklist_no"),
+                    "order_id":    oid_key,
+                    "items":       pl_doc.get("total_items", 0),
+                    "qty":         pl_doc.get("total_qty", 0),
+                })
+        except Exception as pe:
+            log.warning(f"Picklist generation failed for order {oid_key}: {pe}")
+
     await log_activity(
         "IMPORT", "online_orders",
-        f"{channel.capitalize()} CSV import: {imported} jobs created, {unresolved} unresolved, {len(errors)-unresolved} errors",
+        f"{channel.capitalize()} CSV import: {imported} orders, {fulfilled_from_stock} pairs from stock, "
+        f"{len(picklists_created)} picklists, {unresolved} unresolved, {len(errors)-unresolved} errors",
         u["email"],
     )
     return {
-        "channel":    channel,
-        "imported":   imported,
-        "unresolved": unresolved,
-        "errors":     errors,
+        "channel":               channel,
+        "imported":              imported,
+        "unresolved":            unresolved,
+        "fulfilled_from_stock":  fulfilled_from_stock,
+        "picklists_created":     picklists_created,
+        "errors":                errors,
     }
 
 
@@ -6517,6 +6623,803 @@ async def seed_demo(request: Request):
 
 
 # ---------- App wiring ----------
+# ═══════════════════════════════════════════════════════════════════════
+# ══ WAREHOUSE MANAGEMENT SYSTEM (WMS) — Online Commerce Layer ══════════
+# ═══════════════════════════════════════════════════════════════════════
+# Structure: 4 rack blocks (A/B/C/D) × 10 rows × 8 columns = 320 cells.
+# Each cell capacity = 30 pairs. Location code format: A-01-01 .. D-10-08.
+#
+# Collections:
+#   • warehouse_locations       — 320 cells, capacity/occupied/available
+#   • fg_location_inventory     — style×color×size×location → qty
+#   • picklists                 — order fulfillment slips with location details
+#
+# Hook points (do NOT touch B2B production):
+#   • _sync_warehouse_locations() is called from _apply_movement()
+#   • /online-orders/import auto-generates picklists for covered qty
+# ═══════════════════════════════════════════════════════════════════════
+
+RACKS      = ["A", "B", "C", "D"]
+ROWS_PER   = 10
+COLS_PER   = 8
+CAPACITY   = 30  # pairs per cell
+
+
+def _make_location_code(rack: str, row: int, col: int) -> str:
+    return f"{rack}-{row:02d}-{col:02d}"
+
+
+async def _seed_warehouse_locations():
+    """Idempotent — inserts any missing cells into warehouse_locations."""
+    to_upsert = []
+    for rack in RACKS:
+        for r in range(1, ROWS_PER + 1):
+            for c in range(1, COLS_PER + 1):
+                code = _make_location_code(rack, r, c)
+                to_upsert.append({
+                    "location_code":   code,
+                    "rack":            rack,
+                    "row":             r,
+                    "column":          c,
+                    "capacity_pairs":  CAPACITY,
+                    "occupied_pairs":  0,
+                    "available_pairs": CAPACITY,
+                    "status":          "empty",  # empty | partial | full | blocked
+                    "created_at":      now_iso(),
+                    "updated_at":      now_iso(),
+                })
+    inserted = 0
+    for doc in to_upsert:
+        res = await db.warehouse_locations.update_one(
+            {"location_code": doc["location_code"]},
+            {"$setOnInsert": doc},
+            upsert=True,
+        )
+        if res.upserted_id:
+            inserted += 1
+    return inserted
+
+
+def _recompute_status(occupied: int, capacity: int) -> str:
+    if occupied <= 0:
+        return "empty"
+    if occupied >= capacity:
+        return "full"
+    return "partial"
+
+
+async def _allocate_to_locations(style_id, style_code, color, size, qty, user_email,
+                                  reference_type="", reference_id=""):
+    """Sequentially fill cells (by location_code ASC) until qty placed."""
+    remaining = int(qty)
+    placements = []
+    guard = 0
+    while remaining > 0 and guard < 500:
+        guard += 1
+        loc = await db.warehouse_locations.find_one(
+            {"available_pairs": {"$gt": 0}, "status": {"$ne": "blocked"}},
+            sort=[("location_code", 1)],
+        )
+        if not loc:
+            log.warning(f"WMS: warehouse full — {remaining} pairs unplaced for {style_code}/{color}/{size}")
+            break
+        place_qty = min(remaining, int(loc["available_pairs"]))
+        new_occupied  = int(loc["occupied_pairs"]) + place_qty
+        new_available = int(loc["available_pairs"]) - place_qty
+        new_status    = _recompute_status(new_occupied, int(loc["capacity_pairs"]))
+        # Optimistic lock on available_pairs
+        res = await db.warehouse_locations.update_one(
+            {"_id": loc["_id"], "available_pairs": loc["available_pairs"]},
+            {"$set": {
+                "occupied_pairs":  new_occupied,
+                "available_pairs": new_available,
+                "status":          new_status,
+                "updated_at":      now_iso(),
+            }},
+        )
+        if res.modified_count == 0:
+            continue
+        # Upsert fg_location_inventory
+        await db.fg_location_inventory.update_one(
+            {"style_id": ObjectId(style_id), "color": color, "size": size,
+             "location_code": loc["location_code"]},
+            {"$inc": {"qty": place_qty},
+             "$set": {"style_code": style_code, "updated_at": now_iso()},
+             "$setOnInsert": {"created_at": now_iso()}},
+            upsert=True,
+        )
+        placements.append({"location_code": loc["location_code"], "qty": place_qty,
+                            "rack": loc["rack"], "row": loc["row"], "column": loc["column"]})
+        remaining -= place_qty
+    return {"placed_qty": int(qty) - remaining, "unplaced_qty": remaining, "placements": placements}
+
+
+async def _deduct_from_locations(style_id, color, size, qty, user_email,
+                                  reference_type="", reference_id=""):
+    """FIFO deduction: oldest fg_location_inventory doc first (by created_at, then location_code)."""
+    remaining = int(qty)
+    removals = []
+    guard = 0
+    while remaining > 0 and guard < 500:
+        guard += 1
+        loc_inv = await db.fg_location_inventory.find_one(
+            {"style_id": ObjectId(style_id), "color": color, "size": size, "qty": {"$gt": 0}},
+            sort=[("created_at", 1), ("location_code", 1)],
+        )
+        if not loc_inv:
+            break
+        take = min(remaining, int(loc_inv["qty"]))
+        new_qty = int(loc_inv["qty"]) - take
+        if new_qty <= 0:
+            await db.fg_location_inventory.delete_one({"_id": loc_inv["_id"]})
+        else:
+            await db.fg_location_inventory.update_one(
+                {"_id": loc_inv["_id"]},
+                {"$set": {"qty": new_qty, "updated_at": now_iso()}},
+            )
+        # Update warehouse_locations counters
+        wloc = await db.warehouse_locations.find_one({"location_code": loc_inv["location_code"]})
+        if wloc:
+            new_occupied  = max(0, int(wloc["occupied_pairs"]) - take)
+            new_available = min(int(wloc["capacity_pairs"]),
+                                int(wloc["available_pairs"]) + take)
+            new_status    = _recompute_status(new_occupied, int(wloc["capacity_pairs"])) \
+                              if wloc.get("status") != "blocked" else "blocked"
+            await db.warehouse_locations.update_one(
+                {"_id": wloc["_id"]},
+                {"$set": {"occupied_pairs": new_occupied,
+                          "available_pairs": new_available,
+                          "status": new_status,
+                          "updated_at": now_iso()}},
+            )
+        removals.append({"location_code": loc_inv["location_code"], "qty": take})
+        remaining -= take
+    return {"deducted_qty": int(qty) - remaining, "shortfall": remaining, "removals": removals}
+
+
+async def _deduct_from_specific_location(style_id, color, size, qty, location_code):
+    """Deduct qty from a specific location. Used by picklist confirm.
+    Decrements both physical qty AND reserved_qty (picklist reservation is being fulfilled).
+    """
+    loc_inv = await db.fg_location_inventory.find_one({
+        "style_id": ObjectId(style_id), "color": color, "size": size,
+        "location_code": location_code,
+    })
+    if not loc_inv:
+        raise HTTPException(400, f"No stock of {color}/{size} at {location_code}")
+    if int(loc_inv.get("qty", 0)) < int(qty):
+        raise HTTPException(400, f"Only {loc_inv['qty']} pairs at {location_code}, need {qty}")
+    new_qty = int(loc_inv["qty"]) - int(qty)
+    new_res = max(0, int(loc_inv.get("reserved_qty", 0)) - int(qty))
+    if new_qty <= 0:
+        await db.fg_location_inventory.delete_one({"_id": loc_inv["_id"]})
+    else:
+        await db.fg_location_inventory.update_one(
+            {"_id": loc_inv["_id"]},
+            {"$set": {"qty": new_qty, "reserved_qty": new_res, "updated_at": now_iso()}},
+        )
+    wloc = await db.warehouse_locations.find_one({"location_code": location_code})
+    if wloc:
+        new_occ = max(0, int(wloc["occupied_pairs"]) - int(qty))
+        new_av  = min(int(wloc["capacity_pairs"]), int(wloc["available_pairs"]) + int(qty))
+        new_st  = _recompute_status(new_occ, int(wloc["capacity_pairs"])) \
+                    if wloc.get("status") != "blocked" else "blocked"
+        await db.warehouse_locations.update_one(
+            {"_id": wloc["_id"]},
+            {"$set": {"occupied_pairs": new_occ, "available_pairs": new_av,
+                      "status": new_st, "updated_at": now_iso()}},
+        )
+    return True
+
+
+async def _sync_warehouse_locations(payload, user_email):
+    """Central hook. Called from _apply_movement(). Maps FG movements → warehouse actions."""
+    mt = payload.movement_type
+    qty = int(payload.quantity)
+    style_id, color, size = payload.style_id, payload.color, payload.size
+    style = await db.styles.find_one({"_id": ObjectId(style_id)})
+    style_code = style.get("code", "") if style else ""
+    ref = payload.reference_type
+    ref_id = payload.reference_id or ""
+
+    if mt in ("production_in", "return_restocked"):
+        if qty > 0:
+            return await _allocate_to_locations(style_id, style_code, color, size, qty,
+                                                 user_email, ref, ref_id)
+    elif mt in ("dispatched", "liquidation_out"):
+        if qty > 0:
+            return await _deduct_from_locations(style_id, color, size, qty,
+                                                 user_email, ref, ref_id)
+    elif mt == "adjustment" and payload.adjustment_field == "ready_stock_qty":
+        if qty > 0:
+            return await _allocate_to_locations(style_id, style_code, color, size, qty,
+                                                 user_email, ref, ref_id)
+        elif qty < 0:
+            return await _deduct_from_locations(style_id, color, size, abs(qty),
+                                                 user_email, ref, ref_id)
+    return None
+
+
+# ───────────── Warehouse Endpoints ─────────────
+
+@api.get("/warehouse/locations")
+async def wms_list_locations(
+    request: Request,
+    rack: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    """List all warehouse cells with capacity/occupied stats. Filterable."""
+    await get_current_user(request)
+    q = {}
+    if rack: q["rack"] = rack.upper()
+    if status: q["status"] = status
+    if search: q["location_code"] = {"$regex": search, "$options": "i"}
+    docs = await db.warehouse_locations.find(q).sort("location_code", 1).to_list(500)
+    return [stringify(d) for d in docs]
+
+
+@api.get("/warehouse/locations/{code}")
+async def wms_get_location(request: Request, code: str):
+    """Get one cell + list all SKUs stored in it."""
+    await get_current_user(request)
+    loc = await db.warehouse_locations.find_one({"location_code": code.upper()})
+    if not loc:
+        raise HTTPException(404, "Location not found")
+    contents = await db.fg_location_inventory.find({"location_code": code.upper()}).to_list(500)
+    return {"location": stringify(loc), "contents": [stringify(c) for c in contents]}
+
+
+@api.post("/warehouse/seed-locations")
+async def wms_seed(request: Request):
+    """Idempotently seed all 320 cells. Safe to call any time."""
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    inserted = await _seed_warehouse_locations()
+    total = await db.warehouse_locations.count_documents({})
+    return {"inserted": inserted, "total": total}
+
+
+@api.get("/warehouse/fg-locations")
+async def wms_fg_location_inventory(
+    request: Request,
+    style_id: Optional[str] = None,
+    color: Optional[str] = None,
+    size: Optional[str] = None,
+    location_code: Optional[str] = None,
+):
+    """List fg_location_inventory rows. Filterable."""
+    await get_current_user(request)
+    q = {}
+    if style_id:
+        try:
+            q["style_id"] = ObjectId(style_id)
+        except Exception:
+            pass
+    if color: q["color"] = color
+    if size:  q["size"] = size
+    if location_code: q["location_code"] = location_code.upper()
+    docs = await db.fg_location_inventory.find(q).sort("location_code", 1).to_list(2000)
+    return [stringify(d) for d in docs]
+
+
+@api.get("/warehouse/dashboard")
+async def wms_dashboard(request: Request):
+    """Aggregate stats for the warehouse dashboard."""
+    await get_current_user(request)
+    locs = await db.warehouse_locations.find({}).to_list(1000)
+    total_cells      = len(locs)
+    total_capacity   = sum(int(l.get("capacity_pairs", 0))  for l in locs)
+    total_occupied   = sum(int(l.get("occupied_pairs", 0))  for l in locs)
+    total_available  = sum(int(l.get("available_pairs", 0)) for l in locs)
+    empty_cells      = sum(1 for l in locs if l.get("status") == "empty")
+    partial_cells    = sum(1 for l in locs if l.get("status") == "partial")
+    full_cells       = sum(1 for l in locs if l.get("status") == "full")
+    blocked_cells    = sum(1 for l in locs if l.get("status") == "blocked")
+
+    # Per-rack breakdown
+    by_rack = {}
+    for r in RACKS:
+        rlocs = [l for l in locs if l.get("rack") == r]
+        by_rack[r] = {
+            "total_cells":     len(rlocs),
+            "occupied_pairs":  sum(int(l.get("occupied_pairs", 0)) for l in rlocs),
+            "available_pairs": sum(int(l.get("available_pairs", 0)) for l in rlocs),
+            "capacity_pairs":  sum(int(l.get("capacity_pairs", 0)) for l in rlocs),
+            "empty_cells":     sum(1 for l in rlocs if l.get("status") == "empty"),
+            "partial_cells":   sum(1 for l in rlocs if l.get("status") == "partial"),
+            "full_cells":      sum(1 for l in rlocs if l.get("status") == "full"),
+        }
+
+    # Active picklists
+    active_picklists   = await db.picklists.count_documents({"status": {"$in": ["pending", "in_progress"]}})
+    pending_picklists  = await db.picklists.count_documents({"status": "pending"})
+    completed_today    = await db.picklists.count_documents({
+        "status": "completed",
+        "completed_at": {"$gte": now_iso()[:10] + "T00:00:00Z"},
+    })
+
+    # Distinct SKUs stored
+    distinct_skus = len(await db.fg_location_inventory.distinct("style_id"))
+
+    utilization_pct = round((total_occupied / total_capacity * 100), 2) if total_capacity else 0
+    return {
+        "total_cells":       total_cells,
+        "total_capacity":    total_capacity,
+        "total_occupied":    total_occupied,
+        "total_available":   total_available,
+        "utilization_pct":   utilization_pct,
+        "empty_cells":       empty_cells,
+        "partial_cells":     partial_cells,
+        "full_cells":        full_cells,
+        "blocked_cells":     blocked_cells,
+        "distinct_skus":     distinct_skus,
+        "active_picklists":  active_picklists,
+        "pending_picklists": pending_picklists,
+        "completed_today":   completed_today,
+        "by_rack":           by_rack,
+    }
+
+
+# ───────────── Picklist Endpoints ─────────────
+
+async def _next_picklist_no() -> str:
+    """PL-YYYYMMDD-NNN sequential."""
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    prefix = f"PL-{today}-"
+    last = await db.picklists.find({"picklist_no": {"$regex": f"^{prefix}"}}) \
+                             .sort("picklist_no", -1).limit(1).to_list(1)
+    seq = 1
+    if last:
+        try:
+            seq = int(last[0]["picklist_no"].split("-")[-1]) + 1
+        except Exception:
+            seq = 1
+    return f"{prefix}{seq:03d}"
+
+
+async def _generate_picklist_for_order(order_id: str, channel: str, order_lines: List[dict],
+                                        user_email: str):
+    """Build a picklist for an online order using FIFO allocation. Only covers what's
+    available in fg_location_inventory (net of location-level reservations). Returns
+    (picklist_doc, covered_map, uncovered_map).
+
+    order_lines: [{style_id, style_code, color, size, quantity}]
+    """
+    items = []
+    covered = {}     # (style_id,color,size) → qty covered
+    uncovered = {}   # (style_id,color,size) → qty short
+    reservations_to_book = []
+    loc_reservations_to_book = []  # (fg_location_inventory _id, qty) pairs
+
+    for line in order_lines:
+        style_id   = line.get("style_id")
+        style_code = line.get("style_code", "")
+        color      = line.get("color", "")
+        size       = line.get("size", "")
+        need       = int(line.get("quantity", 0))
+        if not style_id or need <= 0:
+            continue
+        # FIFO allocate — find candidate locations
+        remaining = need
+        picked = []
+        cur = db.fg_location_inventory.find({
+            "style_id": ObjectId(style_id), "color": color, "size": size, "qty": {"$gt": 0},
+        }).sort([("created_at", 1), ("location_code", 1)])
+        async for loc in cur:
+            if remaining <= 0:
+                break
+            free_here = int(loc.get("qty", 0)) - int(loc.get("reserved_qty", 0))
+            if free_here <= 0:
+                continue
+            take = min(remaining, free_here)
+            picked.append({
+                "loc_inv_id":    loc["_id"],
+                "location_code": loc["location_code"], "qty": take,
+                "style_id":      str(loc["style_id"]), "style_code": style_code,
+                "color":         color, "size": size,
+            })
+            remaining -= take
+
+        # Enrich each pick with rack/row/col via warehouse_locations
+        codes = list({p["location_code"] for p in picked})
+        wloc_map = {}
+        if codes:
+            async for w in db.warehouse_locations.find({"location_code": {"$in": codes}}):
+                wloc_map[w["location_code"]] = w
+        for p in picked:
+            w = wloc_map.get(p["location_code"], {})
+            item = {
+                "style_id":      p["style_id"], "style_code": p["style_code"],
+                "color":         p["color"],    "size":       p["size"],
+                "location_code": p["location_code"], "qty":    p["qty"],
+                "rack":          w.get("rack"), "row":        w.get("row"),
+                "column":        w.get("column"),
+                "picked":        False, "picked_at": None,
+            }
+            items.append(item)
+            loc_reservations_to_book.append((p["loc_inv_id"], p["qty"]))
+
+        covered_qty = need - remaining
+        if covered_qty > 0:
+            covered[(style_id, color, size)] = covered_qty
+            reservations_to_book.append({
+                "style_id": style_id, "color": color, "size": size,
+                "qty": covered_qty, "style_code": style_code,
+            })
+        if remaining > 0:
+            uncovered[(style_id, color, size)] = remaining
+
+    picklist_no = await _next_picklist_no()
+    doc = {
+        "picklist_no": picklist_no,
+        "order_id":    order_id,
+        "channel":     channel,
+        "status":      "pending",
+        "picker":      None,
+        "items":       items,
+        "total_items": len(items),
+        "total_qty":   sum(i["qty"] for i in items),
+        "created_at":  now_iso(),
+        "updated_at":  now_iso(),
+        "created_by":  user_email,
+        "completed_at": None,
+    }
+    if items:
+        # Book location-level reservations (prevents overlap with future picklists)
+        for loc_inv_id, take in loc_reservations_to_book:
+            try:
+                await db.fg_location_inventory.update_one(
+                    {"_id": loc_inv_id},
+                    {"$inc": {"reserved_qty": int(take)}, "$set": {"updated_at": now_iso()}},
+                )
+            except Exception as e:
+                log.warning(f"Location reservation increment failed: {e}")
+        # Book SKU-level reservations for the covered portion
+        for r in reservations_to_book:
+            try:
+                mv = FgStockMovementIn(
+                    style_id=r["style_id"], color=r["color"], size=r["size"],
+                    movement_type="reserved", quantity=int(r["qty"]),
+                    reference_type="online_order", reference_id=order_id,
+                    online_order_id=order_id, notes=f"Auto-reserved for picklist {picklist_no}",
+                )
+                await _apply_movement(mv, user_email, skip_location_sync=True)
+            except Exception as e:
+                log.warning(f"Reservation booking failed for {r}: {e}")
+        res = await db.picklists.insert_one(doc)
+        doc["_id"] = res.inserted_id
+    return doc, covered, uncovered
+
+
+@api.get("/picklists")
+async def list_picklists(
+    request: Request,
+    status: Optional[str] = None,
+    channel: Optional[str] = None,
+    order_id: Optional[str] = None,
+    picker: Optional[str] = None,
+):
+    await get_current_user(request)
+    q = {}
+    if status:   q["status"] = status
+    if channel:  q["channel"] = channel.lower()
+    if order_id: q["order_id"] = order_id
+    if picker:   q["picker"] = picker
+    docs = await db.picklists.find(q).sort("created_at", -1).to_list(500)
+    return [stringify(d) for d in docs]
+
+
+@api.get("/picklists/{pid}")
+async def get_picklist(request: Request, pid: str):
+    await get_current_user(request)
+    try:
+        doc = await db.picklists.find_one({"_id": ObjectId(pid)})
+    except Exception:
+        doc = None
+    if not doc:
+        raise HTTPException(404, "Picklist not found")
+    return stringify(doc)
+
+
+@api.post("/picklists")
+async def create_picklist(request: Request, payload: PicklistIn):
+    """Manually create a picklist. Auto-generation happens on /online-orders/import."""
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    lines = [{
+        "style_id": i.style_id, "style_code": i.style_code,
+        "color": i.color, "size": i.size, "quantity": i.qty,
+    } for i in payload.items]
+    doc, covered, uncovered = await _generate_picklist_for_order(
+        payload.order_id, payload.channel, lines, u["email"])
+    return {"picklist": stringify(doc),
+            "covered": {f"{k[0]}|{k[1]}|{k[2]}": v for k, v in covered.items()},
+            "uncovered": {f"{k[0]}|{k[1]}|{k[2]}": v for k, v in uncovered.items()}}
+
+
+@api.patch("/picklists/{pid}")
+async def patch_picklist(request: Request, pid: str, payload: PicklistPatchIn):
+    u = await get_current_user(request); require_roles("admin", "manager", "production")(u)
+    upd = {"updated_at": now_iso()}
+    if payload.picker is not None: upd["picker"] = payload.picker
+    if payload.status is not None: upd["status"] = payload.status
+    try:
+        res = await db.picklists.update_one({"_id": ObjectId(pid)}, {"$set": upd})
+    except Exception:
+        raise HTTPException(404, "Picklist not found")
+    if not res.matched_count:
+        raise HTTPException(404, "Picklist not found")
+    doc = await db.picklists.find_one({"_id": ObjectId(pid)})
+    return stringify(doc)
+
+
+@api.post("/picklists/{pid}/pick-item")
+async def pick_item(request: Request, pid: str, payload: PickItemIn):
+    """Confirm a pick: verify scan matches, deduct from that specific location."""
+    u = await get_current_user(request); require_roles("admin", "manager", "production")(u)
+    try:
+        doc = await db.picklists.find_one({"_id": ObjectId(pid)})
+    except Exception:
+        doc = None
+    if not doc:
+        raise HTTPException(404, "Picklist not found")
+    if payload.item_index < 0 or payload.item_index >= len(doc.get("items", [])):
+        raise HTTPException(400, "Invalid item_index")
+    item = doc["items"][payload.item_index]
+    if item.get("picked"):
+        raise HTTPException(400, "Item already picked")
+    if payload.scanned_location.upper().strip() != item["location_code"].upper():
+        raise HTTPException(400,
+            f"Scan mismatch — expected {item['location_code']}, got {payload.scanned_location}")
+
+    # Deduct qty from that exact location
+    await _deduct_from_specific_location(
+        item["style_id"], item["color"], item["size"],
+        int(item["qty"]), item["location_code"],
+    )
+
+    # Post the 'dispatched' ledger row (skip location sync — we already did it)
+    try:
+        mv = FgStockMovementIn(
+            style_id=item["style_id"], color=item["color"], size=item["size"],
+            movement_type="dispatched", quantity=int(item["qty"]),
+            reference_type="online_order", reference_id=doc["order_id"],
+            online_order_id=doc["order_id"], notes=f"Picklist {doc['picklist_no']} item {payload.item_index}",
+        )
+        await _apply_movement(mv, u["email"], skip_location_sync=True)
+    except Exception as e:
+        log.warning(f"Dispatched ledger failed: {e}")
+
+    # Mark this item picked
+    now = now_iso()
+    doc["items"][payload.item_index]["picked"] = True
+    doc["items"][payload.item_index]["picked_at"] = now
+    doc["items"][payload.item_index]["picked_by"] = u["email"]
+
+    all_picked = all(bool(i.get("picked")) for i in doc["items"])
+    new_status = "completed" if all_picked else "in_progress"
+    upd = {"items": doc["items"], "status": new_status, "updated_at": now}
+    if all_picked:
+        upd["completed_at"] = now
+    await db.picklists.update_one({"_id": ObjectId(pid)}, {"$set": upd})
+    updated = await db.picklists.find_one({"_id": ObjectId(pid)})
+    return stringify(updated)
+
+
+@api.delete("/picklists/{pid}")
+async def delete_picklist(request: Request, pid: str):
+    u = await get_current_user(request); require_roles("admin", "manager")(u)
+    try:
+        doc = await db.picklists.find_one({"_id": ObjectId(pid)})
+    except Exception:
+        doc = None
+    if not doc:
+        raise HTTPException(404, "Picklist not found")
+    if doc.get("status") == "completed":
+        raise HTTPException(400, "Cannot delete a completed picklist. Use returns flow instead.")
+    # Release location-level reservations on all unpicked items
+    for it in doc.get("items", []):
+        if it.get("picked"):
+            continue
+        try:
+            await db.fg_location_inventory.update_one(
+                {"style_id": ObjectId(it["style_id"]), "color": it["color"],
+                 "size": it["size"], "location_code": it["location_code"]},
+                {"$inc": {"reserved_qty": -int(it["qty"])}, "$set": {"updated_at": now_iso()}},
+            )
+        except Exception:
+            pass
+    # Release any active reservations tied to this order
+    if doc.get("order_id"):
+        await db.inventory_reservations.update_many(
+            {"online_order_id": doc["order_id"], "status": "active"},
+            {"$set": {"status": "released", "released_at": now_iso()}},
+        )
+        # Also unreserve the qty in fg_inventory (best-effort per-item)
+        for it in doc.get("items", []):
+            if it.get("picked"):
+                continue
+            try:
+                mv = FgStockMovementIn(
+                    style_id=it["style_id"], color=it["color"], size=it["size"],
+                    movement_type="unreserved", quantity=int(it["qty"]),
+                    reference_type="online_order", reference_id=doc["order_id"],
+                    online_order_id=doc["order_id"],
+                    notes=f"Picklist {doc['picklist_no']} cancelled",
+                )
+                await _apply_movement(mv, u["email"], skip_location_sync=True)
+            except Exception:
+                pass
+    await db.picklists.delete_one({"_id": ObjectId(pid)})
+    return {"ok": True}
+
+
+# ───────────── Warehouse Reports ─────────────
+
+@api.get("/warehouse/reports/capacity")
+async def report_capacity(request: Request):
+    """Total capacity, used, available; per-rack breakdown."""
+    await get_current_user(request)
+    locs = await db.warehouse_locations.find({}).to_list(1000)
+    total_capacity  = sum(int(l.get("capacity_pairs", 0))  for l in locs)
+    total_occupied  = sum(int(l.get("occupied_pairs", 0))  for l in locs)
+    total_available = sum(int(l.get("available_pairs", 0)) for l in locs)
+    by_rack = []
+    for r in RACKS:
+        rlocs = [l for l in locs if l.get("rack") == r]
+        cap = sum(int(l.get("capacity_pairs", 0)) for l in rlocs)
+        occ = sum(int(l.get("occupied_pairs", 0)) for l in rlocs)
+        by_rack.append({
+            "rack": r,
+            "cells": len(rlocs),
+            "capacity_pairs":  cap,
+            "occupied_pairs":  occ,
+            "available_pairs": cap - occ,
+            "utilization_pct": round((occ / cap * 100), 2) if cap else 0,
+        })
+    return {
+        "total_cells":     len(locs),
+        "total_capacity":  total_capacity,
+        "total_occupied":  total_occupied,
+        "total_available": total_available,
+        "utilization_pct": round((total_occupied / total_capacity * 100), 2) if total_capacity else 0,
+        "by_rack":         by_rack,
+    }
+
+
+@api.get("/warehouse/reports/location-utilization")
+async def report_location_utilization(request: Request):
+    """Per-cell utilization + top 20 fullest and 20 emptiest."""
+    await get_current_user(request)
+    locs = await db.warehouse_locations.find({}).to_list(1000)
+    rows = []
+    for l in locs:
+        cap = int(l.get("capacity_pairs", 0) or 0)
+        occ = int(l.get("occupied_pairs", 0) or 0)
+        rows.append({
+            "location_code":   l["location_code"],
+            "rack":            l.get("rack"),
+            "row":             l.get("row"),
+            "column":          l.get("column"),
+            "capacity_pairs":  cap,
+            "occupied_pairs":  occ,
+            "available_pairs": cap - occ,
+            "utilization_pct": round((occ / cap * 100), 2) if cap else 0,
+            "status":          l.get("status"),
+        })
+    rows.sort(key=lambda r: r["location_code"])
+    fullest = sorted(rows, key=lambda r: -r["utilization_pct"])[:20]
+    emptiest = sorted([r for r in rows if r["utilization_pct"] < 100], key=lambda r: r["utilization_pct"])[:20]
+    return {"rows": rows, "fullest": fullest, "emptiest": emptiest}
+
+
+@api.get("/warehouse/reports/picking-efficiency")
+async def report_picking_efficiency(request: Request, days: int = 30):
+    """Picker efficiency: picks/hour, avg completion time, orders picked."""
+    await get_current_user(request)
+    since = (datetime.now(timezone.utc) - timedelta(days=int(days))).isoformat()
+    picklists = await db.picklists.find({
+        "status": "completed",
+        "completed_at": {"$gte": since},
+    }).to_list(2000)
+    # Per-picker stats
+    per_picker = {}
+    grand = {"picklists": 0, "items": 0, "qty": 0, "avg_minutes": 0}
+    total_minutes = 0.0
+    total_pl = 0
+    for pl in picklists:
+        picker = pl.get("picker") or pl.get("created_by") or "unknown"
+        try:
+            started = pl.get("created_at", "").replace("Z", "+00:00")
+            ended = pl.get("completed_at", "").replace("Z", "+00:00")
+            t1 = datetime.fromisoformat(started)
+            t2 = datetime.fromisoformat(ended)
+            minutes = max(0.0, (t2 - t1).total_seconds() / 60.0)
+        except Exception:
+            minutes = 0.0
+        items_count = len(pl.get("items", []))
+        qty_count = sum(int(i.get("qty", 0)) for i in pl.get("items", []))
+        row = per_picker.setdefault(picker, {"picker": picker, "picklists": 0,
+                                              "items": 0, "qty": 0, "total_minutes": 0.0})
+        row["picklists"] += 1
+        row["items"]     += items_count
+        row["qty"]       += qty_count
+        row["total_minutes"] += minutes
+        total_minutes += minutes
+        total_pl += 1
+        grand["picklists"] += 1
+        grand["items"]     += items_count
+        grand["qty"]       += qty_count
+
+    for row in per_picker.values():
+        row["avg_minutes_per_picklist"] = round(row["total_minutes"] / max(row["picklists"], 1), 2)
+        row["items_per_hour"] = round((row["items"] / row["total_minutes"] * 60), 2) if row["total_minutes"] else 0
+        row["total_minutes"] = round(row["total_minutes"], 2)
+    grand["avg_minutes_per_picklist"] = round(total_minutes / max(total_pl, 1), 2)
+    grand["items_per_hour"] = round((grand["items"] / total_minutes * 60), 2) if total_minutes else 0
+    return {"days": int(days), "grand_total": grand,
+            "per_picker": sorted(per_picker.values(), key=lambda r: -r["picklists"])}
+
+
+# ───────────── Pending Product List (production role) ─────────────
+
+@api.get("/production/pending-list")
+async def pending_product_list(request: Request):
+    """Online-channel production jobs not yet dispatched, with component-availability
+    flag. This is the printable/mobile Pending Product List for the production role."""
+    await get_current_user(request)
+
+    jobs = await db.production_jobs.find({
+        "source_type": "online_channel",
+        "stage": {"$ne": "dispatched"},
+    }).sort("created_at", 1).to_list(2000)
+
+    # Preload BOM & component stock for each unique style_id
+    style_ids = list({str(j.get("style_id")) for j in jobs if j.get("style_id")})
+    comp_stock_by_style = {}  # style_id → {"components_available": bool, "shortages": [...]}
+    for sid in style_ids:
+        try:
+            oid = ObjectId(sid)
+        except Exception:
+            comp_stock_by_style[sid] = {"components_available": False, "shortages": []}
+            continue
+        bom = await db.style_component_mapping.find({
+            "style_id": oid, "active": {"$ne": False},
+        }).to_list(200)
+        if not bom:
+            comp_stock_by_style[sid] = {"components_available": True, "shortages": [],
+                                         "note": "No BOM mapped"}
+            continue
+        shortages = []
+        ok = True
+        for b in bom:
+            comp = await db.component_master.find_one({"_id": ObjectId(b["component_id"])})
+            if not comp:
+                continue
+            cur = int(comp.get("current_stock", 0)) - int(comp.get("reserved_stock", 0))
+            need_per_pair = float(b.get("qty_per_pair", 1) or 1)
+            if cur <= 0:
+                ok = False
+                shortages.append({
+                    "component_code": comp.get("component_code"),
+                    "component_name": comp.get("component_name"),
+                    "available":      cur,
+                    "per_pair":       need_per_pair,
+                })
+        comp_stock_by_style[sid] = {"components_available": ok, "shortages": shortages}
+
+    out = []
+    for j in jobs:
+        jd = stringify(j)
+        sid = jd.get("style_id")
+        info = comp_stock_by_style.get(sid, {"components_available": False, "shortages": []})
+        jd["components_available"] = bool(info.get("components_available"))
+        jd["component_shortages"]  = info.get("shortages", [])
+        out.append(jd)
+    # Sort: components available first, then by created_at
+    out.sort(key=lambda x: (not x.get("components_available"), x.get("created_at", "")))
+    return out
+
+
 @app.get("/")
 async def root():
     return {
@@ -6525,6 +7428,7 @@ async def root():
     }
 
 app.include_router(api)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -6658,6 +7562,45 @@ async def on_startup():
         )
     except Exception as e:
         log.warning(f"Could not create inventory_reservations indexes: {e}")
+
+    # WMS: warehouse_locations, fg_location_inventory, picklists
+    try:
+        await db.warehouse_locations.create_index("location_code", unique=True,
+                                                   name="warehouse_locations_unique")
+        await db.warehouse_locations.create_index("rack", name="warehouse_locations_rack")
+        await db.warehouse_locations.create_index("status", name="warehouse_locations_status")
+    except Exception as e:
+        log.warning(f"Could not create warehouse_locations indexes: {e}")
+
+    try:
+        await db.fg_location_inventory.create_index(
+            [("style_id", 1), ("color", 1), ("size", 1), ("location_code", 1)],
+            unique=True, name="fg_loc_inv_unique",
+        )
+        await db.fg_location_inventory.create_index("location_code", name="fg_loc_inv_location")
+        await db.fg_location_inventory.create_index(
+            [("style_id", 1), ("color", 1), ("size", 1), ("created_at", 1)],
+            name="fg_loc_inv_fifo",
+        )
+    except Exception as e:
+        log.warning(f"Could not create fg_location_inventory indexes: {e}")
+
+    try:
+        await db.picklists.create_index("picklist_no", unique=True, name="picklists_no_unique")
+        await db.picklists.create_index("order_id", name="picklists_order")
+        await db.picklists.create_index("status",   name="picklists_status")
+        await db.picklists.create_index("channel",  name="picklists_channel")
+        await db.picklists.create_index("created_at", name="picklists_created")
+    except Exception as e:
+        log.warning(f"Could not create picklists indexes: {e}")
+
+    # Auto-seed 320 warehouse cells (idempotent)
+    try:
+        inserted = await _seed_warehouse_locations()
+        if inserted:
+            log.info(f"WMS: seeded {inserted} warehouse cells")
+    except Exception as e:
+        log.warning(f"WMS auto-seed failed: {e}")
 
     await seed_admin(db)
     try:
