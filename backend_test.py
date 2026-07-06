@@ -21,7 +21,7 @@ import sys
 import io
 
 # Backend URL from frontend/.env
-BASE_URL = "https://4411416a-6779-4d1b-ba32-8060d6385338.preview.emergentagent.com/api"
+BASE_URL = "https://bugfix-feature-add.preview.emergentagent.com/api"
 
 # Test credentials from /app/memory/test_credentials.md
 ADMIN_EMAIL = "admin@example.com"
